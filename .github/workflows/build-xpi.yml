@@ -14,22 +14,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare source
+      - name: Check JavaScript syntax
         run: |
-          rm -rf build
-          mkdir build
-          unzip -q MailOrganizer-0.1.87.18-Source.zip -d build
+          node --check src/background.js
+          node --check src/legacy-tools.js
+          node --check src/options.js
+          node --check src/popup.js
+
+      - name: Check manifest
+        run: |
+          python -m json.tool src/manifest.json > /dev/null
 
       - name: Build XPI
         run: |
-          cd build
-          zip -r ../MailOrganizer-${GITHUB_REF_NAME}.xpi . \
-            -x "*.git*" \
-            -x "README.md"
+          cd src
+          zip -r ../MailOrganizer-0.1.87.18.xpi . \
+            -x ".gitkeep" \
+            -x "*.backup"
           cd ..
 
       - name: Upload XPI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MailOrganizer-${{ github.ref_name }}
-          path: MailOrganizer-${{ github.ref_name }}.xpi
+          name: MailOrganizer-0.1.87.18
+          path: MailOrganizer-0.1.87.18.xpi
