@@ -1,0 +1,35 @@
+name: Build Mail Organizer XPI
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare source
+        run: |
+          rm -rf build
+          mkdir build
+          unzip -q MailOrganizer-0.1.87.18-Source.zip -d build
+
+      - name: Build XPI
+        run: |
+          cd build
+          zip -r ../MailOrganizer-${GITHUB_REF_NAME}.xpi . \
+            -x "*.git*" \
+            -x "README.md"
+          cd ..
+
+      - name: Upload XPI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MailOrganizer-${{ github.ref_name }}
+          path: MailOrganizer-${{ github.ref_name }}.xpi
