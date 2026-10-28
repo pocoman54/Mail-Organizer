@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Mail Organizer",
+  "description": "Rule-based incoming mail organizer with testing and activity logging.",
+  "version": "0.1.87.18",
+  "author": "Daniel Lynch",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mail-organizer@local",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": [
+    "accountsRead",
+    "messagesRead",
+    "messagesMove",
+    "messagesUpdate",
+    "storage",
+    "addressBooks",
+    "messagesDelete",
+    "messagesTagsList"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "action": {
+    "default_title": "Mail Organizer",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}
