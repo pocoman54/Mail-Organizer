@@ -689,10 +689,12 @@ function bindStaticControls() {
     show(existing ? "Filter saved." : "New filter added.");
   });
 
-  $("#preferences").addEventListener("click", () => {
+  $("#preferences").addEventListener("click", async () => {
     $("#prefFont").value = String(prefs.fontSize);
     $("#prefSide").value = prefs.checkboxSide;
     $("#prefTheme").value = prefs.theme || "blueTeal";
+    const logSettings = await messenger.storage.local.get({settings:{}});
+    $("#prefLogLimit").value = String([1000,5000,10000,25000,50000].includes(Number(logSettings.settings?.maxLog)) ? Number(logSettings.settings.maxLog) : 25000);
     applyTheme($("#prefTheme").value);
     $("#prefs").classList.add("open");
   });
@@ -707,6 +709,8 @@ function bindStaticControls() {
       theme: $("#prefTheme").value
     };
     await messenger.storage.local.set({ mo168Prefs: prefs });
+    const logSettings = await messenger.storage.local.get({settings:{}});
+    await messenger.storage.local.set({settings:{...logSettings.settings,maxLog:Number($("#prefLogLimit").value)}});
     $("#prefs").classList.remove("open");
     applyPrefs();
   });

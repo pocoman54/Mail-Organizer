@@ -1,40 +1,31 @@
 name: Build Mail Organizer XPI
-
 on:
   workflow_dispatch:
   push:
     tags:
       - "v*"
-
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Check JavaScript syntax
+      - uses: actions/checkout@v4
+      - name: Validate JavaScript
         run: |
           node --check src/background.js
           node --check src/legacy-tools.js
           node --check src/options.js
           node --check src/popup.js
-
-      - name: Check manifest
+      - name: Validate manifest and get version
+        id: version
         run: |
           python -m json.tool src/manifest.json > /dev/null
-
+          echo "value=$(python -c 'import json; print(json.load(open("src/manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
       - name: Build XPI
         run: |
           cd src
-          zip -r ../MailOrganizer-0.1.87.18.xpi . \
-            -x ".gitkeep" \
-            -x "*.backup"
-          cd ..
-
+          zip -r "../MailOrganizer-${{ steps.version.outputs.value }}.xpi" . -x '.gitkeep' '*.backup'
       - name: Upload XPI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MailOrganizer-0.1.87.18
-          path: MailOrganizer-0.1.87.18.xpi
+          name: MailOrganizer-${{ steps.version.outputs.value }}
+          path: MailOrganizer-${{ steps.version.outputs.value }}.xpi

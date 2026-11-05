@@ -6,7 +6,7 @@ const DEFAULTS = {
   log: [],
   filterStats: {},
   excludedAddressStats: {},
-  settings: { enabled: false, incomingTestMode: false, stopAfterFirstMatch: true, maxLog: 1000 }
+  settings: { enabled: false, incomingTestMode: false, stopAfterFirstMatch: true, maxLog: 25000 }
 };
 
 async function getState() {
@@ -328,7 +328,9 @@ async function addLog(entry) {
   const state = await getState();
   const log = state.log || [];
   log.unshift({ time: new Date().toISOString(), ...entry });
-  log.length = Math.min(log.length, state.settings?.maxLog || 1000);
+  const allowed = [1000, 5000, 10000, 25000, 50000];
+  const limit = allowed.includes(Number(state.settings?.maxLog)) ? Number(state.settings.maxLog) : 25000;
+  if (log.length > limit) log.length = limit;
   await messenger.storage.local.set({ log });
 }
 
@@ -355,6 +357,49 @@ async function mo46FolderLabel(folderId) {
   return String(folderId||"(unknown folder)");
 }
 
+// Move confirmation is deliberately conservative: a successful API call is not
+// proof that Thunderbird/IMAP finished moving the message.
+const mo19Sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function mo19SameMessage(a,b){
+  return String(a?.subject||"")===String(b?.subject||"") &&
+    String(a?.author||"")===String(b?.author||"") &&
+    Number(a?.size||0)===Number(b?.size||0) &&
+    Math.abs(new Date(a?.date||0).getTime()-new Date(b?.date||0).getTime())<2000;
+}
+async function mo19CheckDestination(message,folderId){
+  // A bounded scan avoids hanging on very large destination folders.
+  let page=await messenger.messages.list(folderId), count=0, matches=0;
+  while(page && count<2000){
+    for(const candidate of page.messages||[]){
+      count++;
+      if(mo19SameMessage(message,candidate)) matches++;
+    }
+    if(matches>0 || !page.id || count>=2000) break;
+    page=await messenger.messages.continueList(page.id);
+  }
+  return matches>0 ? "FOUND" : (count>=2000 ? "UNKNOWN" : "NOT_FOUND");
+}
+async function mo19CheckSource(message){
+  try {
+    const current=await messenger.messages.get(message.id);
+    if(!current) return "ABSENT";
+    const oldFolder=message.folder?.id;
+    if(!oldFolder || !current.folder?.id) return "UNKNOWN";
+    return String(current.folder.id)===String(oldFolder) ? "PRESENT" : "ABSENT";
+  } catch(e){ return "UNKNOWN"; }
+}
+async function mo19VerifyMove(message,destinationId){
+  let destination="UNKNOWN",source="UNKNOWN";
+  for(let i=0;i<3;i++){
+    await mo19Sleep(2000);
+    try { destination=await mo19CheckDestination(message,destinationId); }
+    catch(e){ destination="UNKNOWN"; }
+    source=await mo19CheckSource(message);
+    if(destination==="FOUND" && source==="ABSENT") return {status:"VERIFIED",source,destination};
+  }
+  return {status:"UNVERIFIED",source,destination};
+}
+
 async function executeActions(message, rule, simulate = false, logContext = {}) {
   const results = [];
   const actionLabel = a => ({move:"Move",copy:"Copy",markRead:"Mark Read",markUnread:"Mark Unread",star:"Add Star",unstar:"Remove Star",tag:"Tag",junk:"Set Junk Status",archive:"Archive",priority:"Set Priority",stop:"Stop Filter Execution",delete:"Delete"}[a?.type] || String(a?.type||"Unknown"));
@@ -367,17 +412,28 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
       }
       if (action.type === "move") {
         const requested=await mo46FolderLabel(action.folderId);
-        const moved=await messenger.messages.move([message.id], action.folderId);
-        const returned=Array.isArray(moved) ? moved[0] : null;
-        const returnedFolderId=returned?.folder?.id || returned?.folderId || "";
-        const returnedLabel=returnedFolderId ? await mo46FolderLabel(returnedFolderId) : "";
-        if(returnedFolderId && String(returnedFolderId)!==String(action.folderId)){
-          throw new Error(`MOVE DESTINATION MISMATCH — requested ${requested} [${action.folderId}], Thunderbird returned ${returnedLabel} [${returnedFolderId}]`);
+        await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"MOVE REQUESTED",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Thunderbird move requested; verifying destination."});
+        await messenger.messages.move([message.id], action.folderId);
+        let verification=await mo19VerifyMove(message,action.folderId);
+        // Retry ONLY when Thunderbird positively confirms the original is still
+        // in its source folder and the destination scan found no matching mail.
+        // Otherwise retry could create duplicate messages.
+        if(verification.source==="PRESENT" && verification.destination==="NOT_FOUND"){
+          await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"RETRY",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Source still contains message; destination not found. Retrying once."});
+          await messenger.messages.move([message.id],action.folderId);
+          verification=await mo19VerifyMove(message,action.folderId);
         }
-        results.push(`Moved → ${requested} [${action.folderId}]${returnedFolderId?` · verified return: ${returnedLabel} [${returnedFolderId}]`:" · Thunderbird returned no destination metadata"}`);
-        // A move invalidates the old message id. It is terminal for this message and prevents double-processing by later filters.
-        // Do not break here: write the per-action SUCCESS log first; the common terminal check below exits afterward.
-        results.stopProcessing = true;
+        const detail=`Move → ${requested} [${action.folderId}] · source=${verification.source}; destination=${verification.destination}`;
+        results.push(detail);
+        results.stopProcessing=true;
+        // A move must not be marked SUCCESS unless confirmed. Even an
+        // unverified move is terminal to avoid unsafe repeated actions.
+        await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:verification.status,rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail});
+        const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(action)+1);
+        if(remaining[0]?.type==="stop"){
+          await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"SUCCESS",rule:rule.name||"",action:"Stop Filter Execution",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Stop after move"});
+        }
+        break;
       } else if (action.type === "copy") {
         const requested=await mo46FolderLabel(action.folderId);
         const copied=await messenger.messages.copy([message.id], action.folderId);
@@ -544,184 +600,98 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
   return matches;
 }
 
-// v0.1.87.18 — Incoming Live settling queue.
-// Wait briefly for Thunderbird/IMAP to finish committing each incoming message,
-// re-fetch it, and process incoming messages sequentially.
-
+// Incoming mail can be announced before an IMAP message has completely settled.
+// Queue new messages, allow Thunderbird a short settling interval, then re-fetch
+// the message before matching. A single worker prevents overlapping live runs.
+const INCOMING_SETTLE_MS = 1500;
+const INCOMING_RETRY_MS = 2000;
+const INCOMING_MAX_FETCH_ATTEMPTS = 3;
 const incomingQueue = [];
 const incomingQueuedIds = new Set();
-let incomingQueueRunning = false;
+let incomingWorkerRunning = false;
+let activeManualRuns = 0;
 
-function incomingDelay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
 
-async function fetchSettledIncomingMessage(messageId, attempts = 3) {
+async function fetchIncomingMessageWithRetry(messageId, folderName){
   let lastError = null;
-
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
+  for(let attempt=1; attempt<=INCOMING_MAX_FETCH_ATTEMPTS; attempt++){
+    try{
       const message = await messenger.messages.get(messageId);
-      if (message) return message;
-    } catch (e) {
-      lastError = e;
-    }
-
-    if (attempt < attempts) {
-      await incomingDelay(2000);
+      if(message) return message;
+      lastError = new Error("Message unavailable");
+    }catch(e){ lastError=e; }
+    if(attempt < INCOMING_MAX_FETCH_ATTEMPTS){
+      await addLog({kind:"INCOMING",mode:"Incoming Live",status:"RETRY",rule:"",action:"Re-fetch",destination:"",subject:"",author:"",messageId,folder:folderName||"",detail:`Message unavailable after settle; retry ${attempt}/${INCOMING_MAX_FETCH_ATTEMPTS-1} in ${INCOMING_RETRY_MS} ms.`});
+      await sleep(INCOMING_RETRY_MS);
     }
   }
-
-  if (lastError) throw lastError;
-  throw new Error(`Message ${messageId} unavailable after ${attempts} attempts.`);
+  throw lastError || new Error("Message unavailable after retries");
 }
 
-async function runIncomingQueue() {
-  if (incomingQueueRunning) return;
-  incomingQueueRunning = true;
-
-  try {
-    while (incomingQueue.length) {
-      const item = incomingQueue.shift();
-      const original = item.message;
-      const messageId = original?.id;
-
-      try {
-        await addLog({
-          kind: "INCOMING",
-          mode: "Incoming Live",
-          status: "PROCESSING",
-          rule: "",
-          action: "Process Incoming",
-          destination: "",
-          subject: original?.subject || "",
-          author: original?.author || "",
-          messageId,
-          folder: item.folder?.name || "",
-          detail: "Incoming message reached settling queue."
-        });
-
-        // Allow Thunderbird/IMAP to finish settling the new message.
-        await incomingDelay(1500);
-
-        const message = await fetchSettledIncomingMessage(messageId, 3);
-
-        const liveState = await getState();
-        const realIncoming = !!liveState.settings?.enabled;
-        const testIncoming =
-          !!liveState.settings?.incomingTestMode && !realIncoming;
-
-        if (!realIncoming && !testIncoming) continue;
-
+async function runIncomingWorker(){
+  if(incomingWorkerRunning) return;
+  incomingWorkerRunning=true;
+  try{
+    while(incomingQueue.length){
+      const item=incomingQueue.shift();
+      try{
+        // Manual Run gets exclusive use of message actions. Incoming mail waits
+        // rather than racing a user-initiated batch over the same folders.
+        while(activeManualRuns>0) await sleep(250);
+        const state=await getState();
+        const realIncoming=!!state.settings?.enabled;
+        const testIncoming=!!state.settings?.incomingTestMode && !realIncoming;
+        if(!realIncoming && !testIncoming) continue;
+        const remaining=Math.max(0, item.readyAt-Date.now());
+        if(remaining) await sleep(remaining);
+        const message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
+        await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"PROCESSING",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Settling delay complete; message re-fetched from Thunderbird."});
         resetMembershipCache();
-        await prewarmMembershipCacheForRules(liveState.rules || []);
-
-        if (testIncoming) {
-          const excluded = await addressBookMembership(
-            extractEmail(message.author || ""),
-            { addressBookName: "ExcludedBook" }
-          );
-
-          if (excluded) {
-            await addLog({
-              status: "INCOMING-TEST-EXCLUDED",
-              rule: "Excluded Senders",
-              subject: message.subject || "",
-              author: message.author || "",
-              folder: item.folder?.name || "",
-              detail: "No changes made"
-            });
-          } else {
-            await processMessage(
-              message,
-              item.folder,
-              true,
-              null,
-              true,
-              "Incoming Test"
-            );
+        await prewarmMembershipCacheForRules(state.rules||[]);
+        if(testIncoming){
+          const excluded=await addressBookMembership(extractEmail(message.author||""),{addressBookName:"ExcludedBook"});
+          if(excluded){
+            await addLog({kind:"INCOMING",mode:"Incoming Test",status:"INCOMING-TEST-EXCLUDED",rule:"Excluded Senders",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"No changes made"});
+          }else{
+            await processMessage(message,item.folder,true,null,true,"Incoming Test");
           }
-        } else {
-          await processMessage(
-            message,
-            item.folder,
-            false,
-            null,
-            true,
-            "Incoming Live"
-          );
+        }else{
+          const names=await processMessage(message,item.folder,false,null,true,"Incoming Live");
+          if(!names.length) await addLog({kind:"INCOMING",mode:"Incoming Live",status:"NO MATCH",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message processed successfully; no enabled filter matched."});
         }
-      } catch (e) {
-        await addLog({
-          kind: "INCOMING",
-          mode: "Incoming Live",
-          status: "FAILED",
-          rule: "",
-          action: "Incoming Queue",
-          destination: "",
-          subject: original?.subject || "",
-          author: original?.author || "",
-          messageId,
-          folder: item.folder?.name || "",
-          detail: e?.message || String(e)
-        });
-      } finally {
-        incomingQueuedIds.delete(String(messageId));
+      }catch(e){
+        await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FAILED",rule:"",action:"Incoming queue",destination:"",subject:item.subject||"",author:item.author||"",messageId:item.messageId,folder:item.folder?.name||"",detail:e?.message||String(e)});
+      }finally{
+        incomingQueuedIds.delete(String(item.messageId));
       }
     }
-  } finally {
-    incomingQueueRunning = false;
-
-    // Catch anything that arrived between the last loop and shutdown.
-    if (incomingQueue.length) {
-      runIncomingQueue();
-    }
+  }finally{
+    incomingWorkerRunning=false;
+    if(incomingQueue.length) void runIncomingWorker();
   }
 }
 
 messenger.messages.onNewMailReceived.addListener(async (folder, messageList) => {
-  const liveState = await getState();
-  const realIncoming = !!liveState.settings?.enabled;
-  const testIncoming =
-    !!liveState.settings?.incomingTestMode && !realIncoming;
-
-  if (!realIncoming && !testIncoming) return;
-
-  let page = messageList;
-
-  while (page) {
-    for (const message of page.messages || []) {
-      if (message?.id === undefined || message?.id === null) continue;
-
-      const key = String(message.id);
-
-      // Suppress duplicate incoming events while this message is queued.
-      if (incomingQueuedIds.has(key)) continue;
-
+  const state=await getState();
+  const realIncoming=!!state.settings?.enabled;
+  const testIncoming=!!state.settings?.incomingTestMode && !realIncoming;
+  if(!realIncoming && !testIncoming) return;
+  let page=messageList;
+  while(page){
+    for(const message of page.messages||[]){
+      const key=String(message.id);
+      if(incomingQueuedIds.has(key)) continue;
       incomingQueuedIds.add(key);
-      incomingQueue.push({ folder, message });
-
-      await addLog({
-        kind: "INCOMING",
-        mode: realIncoming ? "Incoming Live" : "Incoming Test",
-        status: "QUEUED",
-        rule: "",
-        action: "Queue Incoming",
-        destination: "",
-        subject: message.subject || "",
-        author: message.author || "",
-        messageId: message.id,
-        folder: folder?.name || "",
-        detail: "Queued for 1.5-second settling delay before filtering."
-      });
+      incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS});
+      await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"QUEUED",rule:"",action:"Queue",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder?.name||"",detail:`Waiting ${INCOMING_SETTLE_MS} ms before re-fetch and filter evaluation.`});
     }
-
-    if (!page.id) break;
-    page = await messenger.messages.continueList(page.id);
+    if(!page.id) break;
+    page=await messenger.messages.continueList(page.id);
   }
-
-  runIncomingQueue();
+  void runIncomingWorker();
 });
+
 
 async function mo30CollectFolderMessages(folderId){
   let page=await messenger.messages.list(folderId), out=[], safety=0;
@@ -1038,6 +1008,8 @@ messenger.runtime.onMessage.addListener(async request => {
   }
 
   if (request?.type === "runFolder") {
+    activeManualRuns++;
+    try {
     resetMembershipCache();
     const selected = request.ruleIds || null;
     const runState=await getState();
@@ -1067,6 +1039,9 @@ messenger.runtime.onMessage.addListener(async request => {
     }
     if(progressToken)cancelledSimulations.delete(progressToken);
     return {folderCount,count,matchedMessages,noMatch,matches,errors,simulate:false,cancelled,performance:{excludedCacheMs:cacheMs,totalMs:Date.now()-runStart}};
+    } finally {
+      activeManualRuns=Math.max(0,activeManualRuns-1);
+    }
   }
 
   if (request?.type === "getUnmatchedSenders") {

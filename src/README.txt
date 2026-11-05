@@ -1,4 +1,4 @@
-# Mail Organizer 0.1.87.17
+# Mail Organizer 0.1.87.18
 
 Compatibility and reporting release.
 
@@ -14,6 +14,9 @@ Compatibility and reporting release.
 
 0.1.87.17: Added Export Sender Addresses. Select a Thunderbird folder, scan all messages, deduplicate From addresses, compare them with ExcludedBook, search the results, and save the currently displayed addresses as TXT or CSV.
 
+
+## 0.1.87.18
+Incoming Live reliability: new mail is queued for a 1.5-second settling delay, re-fetched from Thunderbird before matching, processed sequentially, and retried when a message is temporarily unavailable. Duplicate incoming events are suppressed, queue/retry/processing states are logged, and Incoming Live waits while a Manual Run is active to reduce action races.
 
 ## 0.1.87.17
 - Incoming Live now automatically captures senders in Unmatched Senders when the full enabled organizational filter chain finishes with no match.
