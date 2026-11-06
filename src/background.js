@@ -379,25 +379,47 @@ async function mo19CheckDestination(message,folderId){
   }
   return matches>0 ? "FOUND" : (count>=2000 ? "UNKNOWN" : "NOT_FOUND");
 }
-async function mo19CheckSource(message){
+async function mo20CheckSource(message, sourceFolderId){
   try {
     const current=await messenger.messages.get(message.id);
     if(!current) return "ABSENT";
-    const oldFolder=message.folder?.id;
-    if(!oldFolder || !current.folder?.id) return "UNKNOWN";
-    return String(current.folder.id)===String(oldFolder) ? "PRESENT" : "ABSENT";
-  } catch(e){ return "UNKNOWN"; }
+    const original=sourceFolderId || message.folder?.id;
+    if(!original || !current.folder?.id) return "UNKNOWN";
+    return String(current.folder.id)===String(original) ? "PRESENT" : "ABSENT";
+  }catch(e){ return "UNKNOWN"; }
 }
-async function mo19VerifyMove(message,destinationId){
+async function mo20VerifyMove(message,destinationId,sourceFolderId){
   let destination="UNKNOWN",source="UNKNOWN";
   for(let i=0;i<3;i++){
     await mo19Sleep(2000);
     try { destination=await mo19CheckDestination(message,destinationId); }
     catch(e){ destination="UNKNOWN"; }
-    source=await mo19CheckSource(message);
+    source=await mo20CheckSource(message,sourceFolderId);
     if(destination==="FOUND" && source==="ABSENT") return {status:"VERIFIED",source,destination};
   }
-  return {status:"UNVERIFIED",source,destination};
+  const status=source==="PRESENT" && destination==="NOT_FOUND" ? "STILL IN SOURCE" : "UNVERIFIED";
+  return {status,source,destination};
+}
+async function mo20VerifyAndLogMove(message, action, rule, logContext, requested){
+  const base={kind:"ACTION",mode:logContext.mode||"Manual Run",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||""};
+  const originalFolderId=logContext.folderId || message.folder?.id;
+  try {
+    let verification=await mo20VerifyMove(message,action.folderId,originalFolderId);
+    if(verification.source==="PRESENT" && verification.destination==="NOT_FOUND"){
+      await addLog({...base,status:"RETRY",detail:"Original message ID still in source; destination not found. Retrying move once."});
+      try {
+        await messenger.messages.move([message.id],action.folderId);
+        verification=await mo20VerifyMove(message,action.folderId,originalFolderId);
+      }catch(e){
+        await addLog({...base,status:"FAILED",detail:`Move retry failed: ${e?.message||String(e)}`});
+        return;
+      }
+    }
+    const detail=`Move → ${requested} [${action.folderId}] · source=${verification.source}; destination=${verification.destination}; originalId=${message.id}`;
+    await addLog({...base,status:verification.status,detail});
+  }catch(e){
+    await addLog({...base,status:"UNVERIFIED",detail:`Verification unavailable: ${e?.message||String(e)}; originalId=${message.id}`});
+  }
 }
 
 async function executeActions(message, rule, simulate = false, logContext = {}) {
@@ -414,21 +436,10 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
         const requested=await mo46FolderLabel(action.folderId);
         await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"MOVE REQUESTED",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Thunderbird move requested; verifying destination."});
         await messenger.messages.move([message.id], action.folderId);
-        let verification=await mo19VerifyMove(message,action.folderId);
-        // Retry ONLY when Thunderbird positively confirms the original is still
-        // in its source folder and the destination scan found no matching mail.
-        // Otherwise retry could create duplicate messages.
-        if(verification.source==="PRESENT" && verification.destination==="NOT_FOUND"){
-          await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"RETRY",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Source still contains message; destination not found. Retrying once."});
-          await messenger.messages.move([message.id],action.folderId);
-          verification=await mo19VerifyMove(message,action.folderId);
-        }
-        const detail=`Move → ${requested} [${action.folderId}] · source=${verification.source}; destination=${verification.destination}`;
-        results.push(detail);
+        // Verify independently so the incoming queue and Manual Run can continue.
+        void mo20VerifyAndLogMove(message,action,rule,logContext,requested);
+        results.push(`Move requested → ${requested} [${action.folderId}]; verification pending`);
         results.stopProcessing=true;
-        // A move must not be marked SUCCESS unless confirmed. Even an
-        // unverified move is terminal to avoid unsafe repeated actions.
-        await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:verification.status,rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail});
         const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(action)+1);
         if(remaining[0]?.type==="stop"){
           await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"SUCCESS",rule:rule.name||"",action:"Stop Filter Execution",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Stop after move"});
@@ -559,7 +570,7 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
     if(!simulate) await recordFilterMatch(rule,message,sourceFolder);
     let terminalAction = false;
     try {
-      const result = await executeActions(message, rule, simulate, {mode,folder:sourceFolder?.name||""});
+      const result = await executeActions(message, rule, simulate, {mode,folder:sourceFolder?.name||"",folderId:sourceFolder?.id||message.folder?.id||""});
       terminalAction = !!result.stopProcessing;
       // Real runs are logged action-by-action inside executeActions(), including
       // action and destination. Keep only a clearly labelled summary for simulation.
