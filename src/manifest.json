@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Mail Organizer",
   "description": "Rule-based incoming mail organizer with testing and activity logging.",
-  "version": "0.1.87.19",
+  "version": "0.1.87.20",
   "author": "Daniel Lynch",
   "browser_specific_settings": {
     "gecko": {
