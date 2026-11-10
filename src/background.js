@@ -329,18 +329,47 @@ async function diagnosticRuleMatch(message, rule) {
   return {matched,conditions:details};
 }
 
-async function addLog(entry) {
-  const state = await getState();
-  const log = state.log || [];
-  log.unshift({ time: new Date().toISOString(), ...entry });
-  const allowed = [1000, 5000, 10000, 25000, 50000];
-  const limit = allowed.includes(Number(state.settings?.maxLog)) ? Number(state.settings.maxLog) : 25000;
-  if (log.length > limit) log.length = limit;
-  await messenger.storage.local.set({ log });
+// v0.1.87.22: coalesce log writes, preserving order and bounding memory.
+const mo22LogQueue=[];
+let mo22LogTimer=null;
+let mo22LogFlushChain=Promise.resolve();
+const MO22_LOG_DELAY_MS=150;
+const MO22_LOG_BATCH_SIZE=40;
+function mo22ScheduleLogFlush(){
+  if(mo22LogTimer!==null) return;
+  mo22LogTimer=setTimeout(()=>{mo22LogTimer=null;void mo22FlushLog().catch(()=>{});},MO22_LOG_DELAY_MS);
+}
+function mo22FlushLog(){
+  if(mo22LogTimer!==null){clearTimeout(mo22LogTimer);mo22LogTimer=null;}
+  mo22LogFlushChain=mo22LogFlushChain.catch(()=>{}).then(async()=>{
+    if(!mo22LogQueue.length)return;
+    const batch=mo22LogQueue.splice(0);
+    try{
+      const st=await messenger.storage.local.get({log:[],settings:{}});
+      const allowed=[1000,5000,10000,25000,50000];
+      const limit=allowed.includes(Number(st.settings?.maxLog))?Number(st.settings.maxLog):25000;
+      const existing=Array.isArray(st.log)?st.log:[];
+      const updated=batch.slice().reverse().concat(existing).slice(0,limit);
+      await messenger.storage.local.set({log:updated});
+    }catch(e){
+      mo22LogQueue.unshift(...batch);
+      mo22ScheduleLogFlush();
+      throw e;
+    }
+  });
+  return mo22LogFlushChain;
+}
+async function addLog(entry){
+  mo22LogQueue.push({time:new Date().toISOString(),...entry});
+  if(mo22LogQueue.length>=MO22_LOG_BATCH_SIZE) void mo22FlushLog().catch(()=>{});
+  else mo22ScheduleLogFlush();
 }
 
 
-async function mo46FolderLabel(folderId) {
+const mo22FolderLabelCache=new Map();
+async function mo22ResolveFolderLabel(folderId) {
+  const key=String(folderId||'');
+
   try {
     const accounts=await messenger.accounts.list();
     async function kids(folder){
@@ -360,6 +389,13 @@ async function mo46FolderLabel(folderId) {
     }
   }catch{}
   return String(folderId||"(unknown folder)");
+}
+async function mo46FolderLabel(folderId){
+  const key=String(folderId||"");
+  if(mo22FolderLabelCache.has(key))return mo22FolderLabelCache.get(key);
+  const label=await mo22ResolveFolderLabel(folderId);
+  mo22FolderLabelCache.set(key,label);
+  return label;
 }
 
 // Move confirmation is deliberately conservative: a successful API call is not
@@ -393,35 +429,29 @@ async function mo20CheckSource(message, sourceFolderId){
     return String(current.folder.id)===String(original) ? "PRESENT" : "ABSENT";
   }catch(e){ return "UNKNOWN"; }
 }
-async function mo20VerifyMove(message,destinationId,sourceFolderId){
-  let destination="UNKNOWN",source="UNKNOWN";
-  for(let i=0;i<3;i++){
-    await mo19Sleep(2000);
-    try { destination=await mo19CheckDestination(message,destinationId); }
-    catch(e){ destination="UNKNOWN"; }
-    source=await mo20CheckSource(message,sourceFolderId);
-    if(destination==="FOUND" && source==="ABSENT") return {status:"VERIFIED",source,destination};
-  }
-  const status=source==="PRESENT" && destination==="NOT_FOUND" ? "STILL IN SOURCE" : "UNVERIFIED";
-  return {status,source,destination};
+// Fast, conservative verification: no destination folder-wide searches.
+// Thunderbird may invalidate the original ID after an IMAP move, so an absent
+// source ID is not proof of delivery. Returned destination metadata is stronger.
+async function mo22VerifyMove(message,destinationId,sourceFolderId,returned){
+  const returnedItems=Array.isArray(returned)?returned:(returned?.messages||[]);
+  const returnedId=returnedItems[0]?.folder?.id||returnedItems[0]?.folderId||returned?.folder?.id||returned?.folderId||"";
+  if(returnedId && String(returnedId)===String(destinationId))
+    return {status:"VERIFIED",source:"UNKNOWN",destination:"RETURNED"};
+  if(returnedId && String(returnedId)!==String(destinationId))
+    return {status:"FAILED",source:"UNKNOWN",destination:"MISMATCH"};
+  await mo19Sleep(750);
+  const source=await mo20CheckSource(message,sourceFolderId);
+  return {status:source==="PRESENT"?"STILL IN SOURCE":"UNVERIFIED",source,destination:"NOT_CHECKED"};
 }
-async function mo20VerifyAndLogMove(message, action, rule, logContext, requested){
+async function mo22VerifyAndLogMove(message,action,rule,logContext,requested,returned){
   const base={kind:"ACTION",mode:logContext.mode||"Manual Run",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||""};
-  const originalFolderId=logContext.folderId || message.folder?.id;
-  try {
-    let verification=await mo20VerifyMove(message,action.folderId,originalFolderId);
-    if(verification.source==="PRESENT" && verification.destination==="NOT_FOUND"){
-      await addLog({...base,status:"RETRY",detail:"Original message ID still in source; destination not found. Retrying move once."});
-      try {
-        await messenger.messages.move([message.id],action.folderId);
-        verification=await mo20VerifyMove(message,action.folderId,originalFolderId);
-      }catch(e){
-        await addLog({...base,status:"FAILED",detail:`Move retry failed: ${e?.message||String(e)}`});
-        return;
-      }
-    }
-    const detail=`Move → ${requested} [${action.folderId}] · source=${verification.source}; destination=${verification.destination}; originalId=${message.id}`;
-    await addLog({...base,status:verification.status,detail});
+  const originalFolderId=logContext.folderId||message.folder?.id;
+  try{
+    const v=await mo22VerifyMove(message,action.folderId,originalFolderId,returned);
+    // Do not automatically retry an IMAP move: a stale message ID or duplicate
+    // notification can otherwise move the wrong copy or create confusing results.
+    const detail=`Move → ${requested} [${action.folderId}] · source=${v.source}; destination=${v.destination}; originalId=${message.id}; no automatic retry`;
+    await addLog({...base,status:v.status,detail});
   }catch(e){
     await addLog({...base,status:"UNVERIFIED",detail:`Verification unavailable: ${e?.message||String(e)}; originalId=${message.id}`});
   }
@@ -440,9 +470,9 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
       if (action.type === "move") {
         const requested=await mo46FolderLabel(action.folderId);
         await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"MOVE REQUESTED",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Thunderbird move requested; verifying destination."});
-        await messenger.messages.move([message.id], action.folderId);
-        // Verify independently so the incoming queue and Manual Run can continue.
-        void mo20VerifyAndLogMove(message,action,rule,logContext,requested);
+        const moveReturned=await messenger.messages.move([message.id], action.folderId);
+        // Verification is non-blocking and never scans the destination folder.
+        void mo22VerifyAndLogMove(message,action,rule,logContext,requested,moveReturned);
         results.push(`Move requested → ${requested} [${action.folderId}]; verification pending`);
         results.stopProcessing=true;
         const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(action)+1);
@@ -751,10 +781,12 @@ messenger.runtime.onMessage.addListener(async request => {
     return {ok:true,messageCount:messages.length,uniqueCount:senders.length,excludedCount:senders.filter(x=>x.inExcludedBook).length,senders};
   }
   if(request?.type==="getActivityLog"){
+    await mo22FlushLog();
     const st=await messenger.storage.local.get({log:[]});
     return {ok:true,log:Array.isArray(st.log)?st.log:[]};
   }
   if(request?.type==="clearActivityLog"){
+    await mo22FlushLog();
     await messenger.storage.local.set({log:[]});
     return {ok:true};
   }
