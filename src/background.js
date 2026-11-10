@@ -10,7 +10,9 @@ const DEFAULTS = {
 };
 
 async function getState() {
-  return await messenger.storage.local.get(DEFAULTS);
+  // Hot path: never load the potentially 25,000-entry Activity Log or stats
+  // merely to read rules and Incoming Live settings.
+  return await messenger.storage.local.get({rules:DEFAULTS.rules,settings:DEFAULTS.settings});
 }
 
 function text(v) { return (v ?? "").toString().toLowerCase(); }
