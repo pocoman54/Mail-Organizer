@@ -292,9 +292,14 @@ async function ruleMatches(message,rule) {
   if(rule.finalCatchAll || rule.matchMode==="finalCatchAll" || rule.matchAll || rule.matchMode==="matchAll") return true;
   const conditions=rule.conditions||[];
   if(!conditions.length) return false;
-  const results=[];
-  for(const c of conditions) results.push(await conditionMatches(message,c));
-  return rule.matchMode==="any" ? results.some(Boolean) : results.every(Boolean);
+  // Short-circuit as soon as the result is determined. Avoid expensive
+  // address-book/API checks for conditions that cannot change the outcome.
+  if(rule.matchMode==="any"){
+    for(const c of conditions) if(await conditionMatches(message,c)) return true;
+    return false;
+  }
+  for(const c of conditions) if(!(await conditionMatches(message,c))) return false;
+  return true;
 }
 
 async function diagnosticRuleMatch(message, rule) {
@@ -541,19 +546,19 @@ function isOrganizationalRule(rule) {
   return true;
 }
 
-async function processMessage(message, sourceFolder, simulate = false, selectedRuleIds = null, logNoMatch = false, mode = "Manual Run") {
-  const state = await getState();
+async function processMessage(message, sourceFolder, simulate = false, selectedRuleIds = null, logNoMatch = false, mode = "Manual Run", runContext = null) {
+  const state = runContext?.state || await getState();
   if (!state.settings.enabled && !simulate && selectedRuleIds === null) return [];
   // ExcludedBook is handled by the visible "Excluded Senders" rule.
   // Do NOT short-circuit here: doing so bypasses that rule's configured actions
   // (for example Move to NonFilter, then Stop Filter Execution).
-  let rules = [...(state.rules || [])]
+  let rules = runContext?.rules || [...(state.rules || [])]
     .sort((a,b) => (a.order ?? 9999) - (b.order ?? 9999));
-  if (selectedRuleIds) {
+  if (selectedRuleIds && !runContext?.rules) {
     // Safety rule: disabled filters never run, even when explicitly selected manually.
     const wanted = new Set(selectedRuleIds.map(String));
     rules = rules.filter(r => wanted.has(String(r.id)) && r.enabled !== false);
-  } else {
+  } else if (!runContext?.rules) {
     // Normal incoming processing only uses enabled rules.
     rules = rules.filter(r => r.enabled !== false);
   }
@@ -1025,7 +1030,8 @@ messenger.runtime.onMessage.addListener(async request => {
     const selected = request.ruleIds || null;
     const runState=await getState();
     const wantedIds=selected ? new Set(selected.map(String)) : null;
-    const runRules=(runState.rules||[]).filter(r=>r.enabled!==false && (!wantedIds || wantedIds.has(String(r.id))));
+    const runRules=(runState.rules||[]).filter(r=>r.enabled!==false && (!wantedIds || wantedIds.has(String(r.id)))).sort((a,b)=>(a.order??9999)-(b.order??9999));
+    const runContext={state:runState,rules:runRules};
     const progressToken=String(request.progressToken||"");
     if(progressToken) await emitSimulationProgress(progressToken,0,0,request.folderName||"","Loading ExcludedBook cache");
     const cacheStart=Date.now();
@@ -1039,7 +1045,7 @@ messenger.runtime.onMessage.addListener(async request => {
     for (const message of allFolderMessages) {
       if(progressToken && cancelledSimulations.has(progressToken)){cancelled=true;break;}
       try {
-        const names=await processMessage(message,{name:request.folderName||"Manual run"},false,selected,false,"Manual Run");
+        const names=await processMessage(message,{name:request.folderName||"Manual run",id:request.folderId},false,selected,false,"Manual Run",runContext);
         count++;
         if(names.length){
           matchedMessages++;
