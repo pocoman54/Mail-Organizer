@@ -652,6 +652,10 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
 // Queue new messages, allow Thunderbird a short settling interval, then re-fetch
 // the message before matching. A single worker prevents overlapping live runs.
 const INCOMING_SETTLE_MS = 1500;
+// On extension startup, let Thunderbird finish its first IMAP sync burst.
+const MO23_STARTUP_READY_AT = Date.now() + 10000;
+const MO23_BATCH_SIZE = 25;
+const mo23RecentProcessed = new Map();
 const INCOMING_RETRY_MS = 2000;
 const INCOMING_MAX_FETCH_ATTEMPTS = 3;
 const incomingQueue = [];
@@ -681,13 +685,26 @@ async function runIncomingWorker(){
   if(incomingWorkerRunning) return;
   incomingWorkerRunning=true;
   try{
+    let batchState=null, batchCount=0;
     while(incomingQueue.length){
       const item=incomingQueue.shift();
       try{
         // Manual Run gets exclusive use of message actions. Incoming mail waits
         // rather than racing a user-initiated batch over the same folders.
         while(activeManualRuns>0) await sleep(250);
-        const state=await getState();
+        const startupWait=MO23_STARTUP_READY_AT-Date.now();
+        if(startupWait>0) await sleep(startupWait);
+        // Reuse one rules snapshot and one membership cache for each batch.
+        if(!batchState || batchCount>=MO23_BATCH_SIZE){
+          batchState=await getState(); batchCount=0;
+          resetMembershipCache();
+          await prewarmMembershipCacheForRules(batchState.rules||[]);
+          await sleep(100);
+        }
+        batchCount++;
+        const state=batchState;
+        const recentKey=String(item.folder?.id||"")+":"+String(item.messageId);
+        if((mo23RecentProcessed.get(recentKey)||0)>Date.now()-600000) continue;
         const realIncoming=!!state.settings?.enabled;
         const testIncoming=!!state.settings?.incomingTestMode && !realIncoming;
         if(!realIncoming && !testIncoming) continue;
@@ -695,8 +712,6 @@ async function runIncomingWorker(){
         if(remaining) await sleep(remaining);
         const message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
         await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"PROCESSING",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Settling delay complete; message re-fetched from Thunderbird."});
-        resetMembershipCache();
-        await prewarmMembershipCacheForRules(state.rules||[]);
         if(testIncoming){
           const excluded=await addressBookMembership(extractEmail(message.author||""),{addressBookName:"ExcludedBook"});
           if(excluded){
@@ -708,6 +723,8 @@ async function runIncomingWorker(){
           const names=await processMessage(message,item.folder,false,null,true,"Incoming Live");
           if(!names.length) await addLog({kind:"INCOMING",mode:"Incoming Live",status:"NO MATCH",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message processed successfully; no enabled filter matched."});
         }
+        mo23RecentProcessed.set(recentKey,Date.now());
+        if(mo23RecentProcessed.size>3000){for(const [k,t] of mo23RecentProcessed){if(t<Date.now()-600000)mo23RecentProcessed.delete(k);}}
       }catch(e){
         await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FAILED",rule:"",action:"Incoming queue",destination:"",subject:item.subject||"",author:item.author||"",messageId:item.messageId,folder:item.folder?.name||"",detail:e?.message||String(e)});
       }finally{
@@ -1089,7 +1106,16 @@ messenger.runtime.onMessage.addListener(async request => {
       if(count===1 || count%5===0 || count===folderCount) await emitSimulationProgress(progressToken,count,folderCount,request.folderName||"","Matching / actions");
     }
     if(progressToken)cancelledSimulations.delete(progressToken);
-    return {folderCount,count,matchedMessages,noMatch,matches,errors,simulate:false,cancelled,performance:{excludedCacheMs:cacheMs,totalMs:Date.now()-runStart}};
+    // Final sweep: report only; never retry a move automatically.
+    let finalSweep={remaining:null,remainingFromOriginal:null,error:null};
+    try{
+      await sleep(800);
+      const remaining=await mo30CollectFolderMessages(request.folderId);
+      const originalIds=new Set(allFolderMessages.map(m=>String(m.id)));
+      finalSweep={remaining:remaining.length,remainingFromOriginal:remaining.filter(m=>originalIds.has(String(m.id))).length,error:null};
+      await addLog({kind:"MANUAL",mode:"Manual Run",status:"FINAL SWEEP",rule:"",action:"Check remaining",destination:"",subject:"",author:"",folder:request.folderName||"",detail:`After processing: ${remaining.length} messages remain in source; ${finalSweep.remainingFromOriginal} have original message IDs. No automatic retries.`});
+    }catch(e){finalSweep.error=String(e?.message||e);}
+    return {folderCount,count,matchedMessages,noMatch,matches,errors,simulate:false,cancelled,finalSweep,performance:{excludedCacheMs:cacheMs,totalMs:Date.now()-runStart}};
     } finally {
       activeManualRuns=Math.max(0,activeManualRuns-1);
     }
