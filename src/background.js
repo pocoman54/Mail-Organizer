@@ -688,6 +688,7 @@ async function runIncomingWorker(){
     let batchState=null, batchCount=0;
     while(incomingQueue.length){
       const item=incomingQueue.shift();
+      mo25CurrentMessageId=item.messageId;
       try{
         // Manual Run gets exclusive use of message actions. Incoming mail waits
         // rather than racing a user-initiated batch over the same folders.
@@ -711,6 +712,10 @@ async function runIncomingWorker(){
         const remaining=Math.max(0, item.readyAt-Date.now());
         if(remaining) await sleep(remaining);
         const message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
+        if(item.recovery && String(message.folder?.id||"")!==String(item.folder?.id||"")){
+          await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SKIPPED MOVED",rule:"",action:"Skip",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message no longer in the original Inbox; not processed again."});
+          continue;
+        }
         await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"PROCESSING",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Settling delay complete; message re-fetched from Thunderbird."});
         if(testIncoming){
           const excluded=await addressBookMembership(extractEmail(message.author||""),{addressBookName:"ExcludedBook"});
@@ -724,11 +729,14 @@ async function runIncomingWorker(){
           if(!names.length) await addLog({kind:"INCOMING",mode:"Incoming Live",status:"NO MATCH",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message processed successfully; no enabled filter matched."});
         }
         mo23RecentProcessed.set(recentKey,Date.now());
+        mo25LastProgress=Date.now();
+        if(item.recovery) mo25Recovered++;
         if(mo23RecentProcessed.size>3000){for(const [k,t] of mo23RecentProcessed){if(t<Date.now()-600000)mo23RecentProcessed.delete(k);}}
       }catch(e){
         await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FAILED",rule:"",action:"Incoming queue",destination:"",subject:item.subject||"",author:item.author||"",messageId:item.messageId,folder:item.folder?.name||"",detail:e?.message||String(e)});
       }finally{
         incomingQueuedIds.delete(String(item.messageId));
+        mo25CurrentMessageId=null;
       }
     }
   }finally{
@@ -741,6 +749,11 @@ async function runIncomingWorker(){
 // A candidate means no live queue event was observed by this extension session;
 // it does NOT establish that a filter would match.
 const MO24_SCAN_INTERVAL_MS=60000;
+const MO25_RECOVERY_WINDOW_MS=2*60*60*1000;
+let mo25LastProgress=Date.now();
+let mo25LastScan=0;
+let mo25Recovered=0;
+let mo25CurrentMessageId=null;
 const MO24_MAX_AGE_MS=24*60*60*1000;
 const mo24ObservedIds=new Map();
 let mo24ScanRunning=false;
@@ -771,12 +784,14 @@ async function mo24InboxFolders(){
   return out;
 }
 async function mo24Reconcile(){
-  if(mo24ScanRunning||activeManualRuns>0||incomingWorkerRunning||incomingQueue.length)return;
+  if(mo24ScanRunning||activeManualRuns>0)return;
   if(Date.now()<MO23_STARTUP_READY_AT+10000)return;
   const state=await getState();
   if(!state.settings?.enabled)return;
   mo24ScanRunning=true;
+  mo25LastScan=Date.now();
   try{
+    let recoveryQueued=0;
     for(const folder of await mo24InboxFolders()){
       let page=await messenger.messages.list(folder.id),scanned=0;
       while(page && scanned<500){
@@ -784,21 +799,35 @@ async function mo24Reconcile(){
           if(++scanned>500)break;
           const id=String(message.id);
           const received=message.date?new Date(message.date).getTime():0;
-          if(!received||received<Date.now()-MO24_MAX_AGE_MS)continue;
-          if(mo24ObservedIds.has(id))continue;
+          if(!received||received<Date.now()-MO25_RECOVERY_WINDOW_MS)continue;
+          if(mo24ObservedIds.has(id)||incomingQueuedIds.has(id))continue;
+          if(recoveryQueued>=30)break;
           mo24Observe(id);
-          await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"RECOVERY CANDIDATE",rule:"",action:"Inspect only",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder.name||"Inbox",detail:"Recent Inbox message had no Incoming Live notification observed in this extension session. Diagnostic only: no filters evaluated and no mail modified."});
+          incomingQueuedIds.add(id);
+          incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS,recovery:true});
+          recoveryQueued++;
+          await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"RECOVERY QUEUED",rule:"",action:"Queue for live filters",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder.name||"Inbox",detail:"Message not observed in live listener; queued for normal enabled rules. Thunderbird folder checked again before actions."});
         }
         if(!page.id||scanned>=500)break;
         page=await messenger.messages.continueList(page.id);
       }
     }
+    if(recoveryQueued) void runIncomingWorker();
   }catch(e){
     await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SCAN ERROR",rule:"",action:"Inspect only",detail:String(e?.message||e)});
   }finally{mo24ScanRunning=false;}
 }
 setInterval(()=>{void mo24Reconcile();},MO24_SCAN_INTERVAL_MS);
 setTimeout(()=>{void mo24Reconcile();},20000);
+// Watchdog: report a potentially stalled worker, never forcibly restart an active action.
+setInterval(async ()=>{
+  if(!incomingQueue.length || !incomingWorkerRunning){if(incomingQueue.length&&!incomingWorkerRunning)void runIncomingWorker();return;}
+  if(activeManualRuns>0)return;
+  if(Date.now()-mo25LastProgress>120000){
+    await addLog({kind:"WATCHDOG",mode:"Incoming Live",status:"POSSIBLE STALL",rule:"",action:"Monitor",detail:`Worker active; queue=${incomingQueue.length}; current message=${mo25CurrentMessageId}; last completed ${Math.round((Date.now()-mo25LastProgress)/1000)}s ago. No forced restart to avoid duplicate moves.`});
+    mo25LastProgress=Date.now();
+  }
+},30000);
 
 messenger.messages.onNewMailReceived.addListener(async (folder, messageList) => {
   const state=await getState();
@@ -835,6 +864,10 @@ async function mo30CollectFolderMessages(folderId){
 }
 
 messenger.runtime.onMessage.addListener(async request => {
+  if(request?.type==="getIncomingHealth"){
+    const state=await getState();
+    return {ok:true,enabled:!!state.settings?.enabled,workerRunning:incomingWorkerRunning,queued:incomingQueue.length,currentMessageId:mo25CurrentMessageId,lastProgress:mo25LastProgress,lastScan:mo25LastScan,recovered:mo25Recovered,scanRunning:mo24ScanRunning};
+  }
   if(request?.type==="exportFolderSenders"){
     const folderId=String(request.folderId||"");
     if(!folderId || folderId.startsWith("__ACCOUNT__:")) return {ok:false,error:"Choose one specific Thunderbird folder."};
