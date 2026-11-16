@@ -737,6 +737,69 @@ async function runIncomingWorker(){
   }
 }
 
+// .24 diagnostic-only reconciliation. Never moves, marks or otherwise changes mail.
+// A candidate means no live queue event was observed by this extension session;
+// it does NOT establish that a filter would match.
+const MO24_SCAN_INTERVAL_MS=60000;
+const MO24_MAX_AGE_MS=24*60*60*1000;
+const mo24ObservedIds=new Map();
+let mo24ScanRunning=false;
+function mo24Observe(id){
+  mo24ObservedIds.set(String(id),Date.now());
+  if(mo24ObservedIds.size>5000){
+    const cutoff=Date.now()-MO24_MAX_AGE_MS;
+    for(const [key,t] of mo24ObservedIds) if(t<cutoff) mo24ObservedIds.delete(key);
+  }
+}
+async function mo24InboxFolders(){
+  const accounts=await messenger.accounts.list();
+  const out=[];
+  for(const account of accounts||[]){
+    const roots=account.rootFolder?[account.rootFolder]:(account.folders||[]);
+    const pending=[...roots],visited=new Set();
+    while(pending.length){
+      const folder=pending.shift();
+      if(!folder?.id||visited.has(String(folder.id)))continue;
+      visited.add(String(folder.id));
+      if(folder.type==="inbox" || String(folder.name||"").toLowerCase()==="inbox")out.push(folder);
+      // Only descend when needed; folders API differs by Thunderbird version.
+      let children=[];
+      try{children=messenger.folders?.getSubFolders?await messenger.folders.getSubFolders(folder.id,false):(folder.subFolders||folder.folders||[]);}catch(e){children=folder.subFolders||folder.folders||[];}
+      pending.push(...(children||[]));
+    }
+  }
+  return out;
+}
+async function mo24Reconcile(){
+  if(mo24ScanRunning||activeManualRuns>0||incomingWorkerRunning||incomingQueue.length)return;
+  if(Date.now()<MO23_STARTUP_READY_AT+10000)return;
+  const state=await getState();
+  if(!state.settings?.enabled)return;
+  mo24ScanRunning=true;
+  try{
+    for(const folder of await mo24InboxFolders()){
+      let page=await messenger.messages.list(folder.id),scanned=0;
+      while(page && scanned<500){
+        for(const message of page.messages||[]){
+          if(++scanned>500)break;
+          const id=String(message.id);
+          const received=message.date?new Date(message.date).getTime():0;
+          if(!received||received<Date.now()-MO24_MAX_AGE_MS)continue;
+          if(mo24ObservedIds.has(id))continue;
+          mo24Observe(id);
+          await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"RECOVERY CANDIDATE",rule:"",action:"Inspect only",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder.name||"Inbox",detail:"Recent Inbox message had no Incoming Live notification observed in this extension session. Diagnostic only: no filters evaluated and no mail modified."});
+        }
+        if(!page.id||scanned>=500)break;
+        page=await messenger.messages.continueList(page.id);
+      }
+    }
+  }catch(e){
+    await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SCAN ERROR",rule:"",action:"Inspect only",detail:String(e?.message||e)});
+  }finally{mo24ScanRunning=false;}
+}
+setInterval(()=>{void mo24Reconcile();},MO24_SCAN_INTERVAL_MS);
+setTimeout(()=>{void mo24Reconcile();},20000);
+
 messenger.messages.onNewMailReceived.addListener(async (folder, messageList) => {
   const state=await getState();
   const realIncoming=!!state.settings?.enabled;
@@ -746,6 +809,7 @@ messenger.messages.onNewMailReceived.addListener(async (folder, messageList) => 
   while(page){
     for(const message of page.messages||[]){
       const key=String(message.id);
+      mo24Observe(message.id);
       if(incomingQueuedIds.has(key)) continue;
       incomingQueuedIds.add(key);
       incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS});
