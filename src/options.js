@@ -997,3 +997,17 @@ startup().catch(e => {
 function fileStamp(){return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);}
 function saveTextFile(name,text,type="text/plain"){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 
+
+async function mo25RefreshHealth(){
+ const el=document.querySelector("#mo25Health");if(!el)return;
+ try{
+  const h=await messenger.runtime.sendMessage({type:"getIncomingHealth"});
+  if(!h?.ok){el.textContent="Monitor: unavailable";return;}
+  if(!h.enabled){el.textContent="Monitor: OFF";return;}
+  const stale=h.workerRunning && h.queued>0 && Date.now()-h.lastProgress>120000;
+  el.textContent=stale?"Monitor: POSSIBLE STALL":h.workerRunning?"Monitor: working · "+h.queued+" queued":"Monitor: idle · "+h.queued+" queued · recovered "+h.recovered;
+  el.title="Last scan: "+(h.lastScan?new Date(h.lastScan).toLocaleTimeString():"not yet")+"; last completed: "+(h.lastProgress?new Date(h.lastProgress).toLocaleTimeString():"none");
+ }catch(e){el.textContent="Monitor: unavailable";}
+}
+setInterval(()=>{void mo25RefreshHealth();},10000);
+void mo25RefreshHealth();
