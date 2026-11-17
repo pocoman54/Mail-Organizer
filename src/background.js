@@ -451,6 +451,15 @@ async function mo22VerifyMove(message,destinationId,sourceFolderId,returned){
   }
   await mo19Sleep(750);
   const source=await mo20CheckSource(message,sourceFolderId);
+  if(source!=="PRESENT"){
+    // Bounded, single-page destination check. A metadata match is useful evidence,
+    // but not a unique identity proof; never label it VERIFIED or retry the move.
+    try{
+      const page=await messenger.messages.list(destinationId);
+      const matches=(page?.messages||[]).filter(candidate=>mo19SameMessage(message,candidate));
+      if(matches.length===1)return {status:"DESTINATION MATCH",source,destination:"FIRST_PAGE_METADATA_MATCH"};
+    }catch(e){}
+  }
   return {status:source==="PRESENT"?"STILL IN SOURCE":"UNVERIFIED",source,destination:"NOT_CONFIRMED"};
 }
 async function mo22VerifyAndLogMove(message,action,rule,logContext,requested,returned){
