@@ -8,6 +8,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({
 
 let rules = [];
 let folders = [];
+let mo28Accounts = [];
 let selectedId = null;
 let selectedIds = new Set();
 let selectionAnchorId = null;
@@ -209,7 +210,11 @@ function render() {
   const q = $("#search").value.trim().toLowerCase();
   const shown = [];
   rules.forEach((r, i) => {
-    if (friendly(r.name).toLowerCase().includes(q)) shown.push([r, i]);
+    const scope=$("#searchScope")?.value||"all";
+    const name=friendly(r.name).toLowerCase();
+    const conditions=(r.conditions||[]).map(c=>[c.field,c.operator,c.value,c.addressBookName,c.mailingListName].join(" ")).join(" ").toLowerCase();
+    const actions=(r.actions||[]).map(a=>[a.type,a.folderId,JSON.stringify(a.folderMap||{}),folders.find(f=>String(f.id)===String(a.folderId))?.name||""].join(" ")).join(" ").toLowerCase();
+    if(!q || (scope==="names"?name:scope==="conditions"?conditions:scope==="actions"?actions:[name,conditions,actions].join(" ")).includes(q))shown.push([r,i]);
   });
 
   $("#rows").innerHTML = shown.map(([r, i]) => `
@@ -414,22 +419,45 @@ function actionValueControl(a={}){
 }
 const ACTIONS=[["move","Move Message to",true],["copy","Copy Message to",true],["markRead","Mark As Read",true],["markUnread","Mark As Unread",true],["star","Add Star",true],["unstar","Remove Star",true],["tag","Tag Message",true],["priority","Set Priority",false],["junk","Set Junk Status",true],["archive","Archive Message",true],["stop","Stop Filter Execution",true],["delete","Delete Message",true]];
 function actRow(a={}){
- const d=document.createElement("div");d.className="tbrow action act";
- d.innerHTML=`<select class="t">${ACTIONS.map(x=>`<option value="${x[0]}">${x[1]}${x[2]?"":" ⚠"}</option>`).join("")}</select><span class="vh"></span><button class="mini plus" type="button">+</button><button class="mini minus" type="button">−</button><div class="cap"></div>`;
+ const d=document.createElement("div");d.className="tbrow action act";d.mo28FolderMap={...(a.folderMap||{})};
+ d.innerHTML=`<select class="t">${ACTIONS.map(x=>`<option value="${x[0]}">${x[1]}${x[2]?"":" ⚠"}</option>`).join("")}</select><span class="vh"></span><button class="mini plus" type="button">+</button><button class="mini minus" type="button">−</button><button class="mini mo28Map" type="button" title="Map a different destination for an account">Map Accounts</button><div class="cap"></div>`;
  const t=d.querySelector(".t"),vh=d.querySelector(".vh"),cap=d.querySelector(".cap");t.value=a.type||"move";
  const rebuild=(seed={})=>{vh.replaceChildren(actionValueControl({...seed,type:t.value}));const m=ACTIONS.find(x=>x[0]===t.value);cap.innerHTML=m?.[2]?'<span class="okcap">Engine supported</span>':'<span class="waitcap">Thunderbird option — engine support pending</span>'};
- rebuild(a);t.onchange=()=>rebuild({});d.querySelector(".plus").onclick=()=>d.after(actRow());d.querySelector(".minus").onclick=()=>{if($("#acts").children.length>1)d.remove()};return d
+ rebuild(a);t.onchange=()=>{d.mo28FolderMap={};rebuild({})};
+ d.querySelector(".mo28Map").onclick=()=>{
+   if(t.value!=="move"&&t.value!=="copy")return alert("Account destination mapping is available for Move and Copy actions.");
+   if(!mo28Accounts.length)return alert("No Thunderbird accounts found.");
+   const menu=mo28Accounts.map((x,i)=>(i+1)+". "+x.name).join("\\n");
+   const accountPick=prompt("Choose account number to map (Cancel to leave unchanged):\\n"+menu,"1");
+   if(accountPick===null)return;
+   const account=mo28Accounts[Number(accountPick)-1];if(!account)return alert("Invalid account number.");
+   const candidates=folders.filter(f=>!f.isAccount&&String(f.accountId)===String(account.id));
+   const folderMenu=candidates.map((f,i)=>(i+1)+". "+f.name).join("\\n");
+   const choice=prompt("Destination in "+account.name+" (enter 0 to clear mapping):\\n"+folderMenu,"1");
+   if(choice===null)return;
+   if(choice.trim()==="0")delete d.mo28FolderMap[account.id];
+   else {const folder=candidates[Number(choice)-1];if(!folder)return alert("Invalid folder number.");d.mo28FolderMap[account.id]=folder.id;}
+   alert("Destination mapping saved in editor. Click Save to apply.");
+ };
+ d.querySelector(".plus").onclick=()=>d.after(actRow());d.querySelector(".minus").onclick=()=>{if($("#acts").children.length>1)d.remove()};return d
 }
-function editorMarkup(){return`<div class="line"><label>Filter Name</label><input id="ename"></div><div class="line"><label>Enabled</label><label><input id="een" type="checkbox"> Run this filter</label></div><div class="tbmatch"><b>Match:</b><label><input type="radio" name="mm" value="all" checked> all of the following</label><label><input type="radio" name="mm" value="any"> any of the following</label><label><input type="radio" name="mm" value="matchAll"> all messages</label><label title="Runs only if no earlier filter matched"><input type="radio" name="mm" value="finalCatchAll"> final catch-all</label></div><fieldset class="tbsection"><legend>Conditions</legend><div id="conds"></div></fieldset><fieldset class="tbsection"><legend>Perform these actions</legend><div id="acts"></div></fieldset>`}
+function mo28AccountMarkup(){
+ return '<fieldset class="tbsection"><legend>Accounts (unchecked = not included; no selections = all accounts)</legend><div id="mo28AccountChoices" style="display:flex;gap:12px;flex-wrap:wrap">'+mo28Accounts.map(a=>'<label><input type="checkbox" class="mo28Account" value="'+esc(a.id)+'"> '+esc(a.name)+'</label>').join("")+'</div><small>Existing filters apply to all accounts unless you select specific accounts. Destinations can be mapped per account below.</small></fieldset>';
+}
+function mo28SetAccountChecks(ids){
+ const selected=new Set((ids||[]).map(String));
+ document.querySelectorAll(".mo28Account").forEach(x=>x.checked=selected.has(x.value));
+}
+function editorMarkup(){return`<div class="line"><label>Filter Name</label><input id="ename"></div><div class="line"><label>Enabled</label><label><input id="een" type="checkbox"> Run this filter</label></div><div class="tbmatch"><b>Match:</b><label><input type="radio" name="mm" value="all" checked> all of the following</label><label><input type="radio" name="mm" value="any"> any of the following</label><label><input type="radio" name="mm" value="matchAll"> all messages</label><label title="Runs only if no earlier filter matched"><input type="radio" name="mm" value="finalCatchAll"> final catch-all</label></div>${mo28AccountMarkup()}<fieldset class="tbsection"><legend>Conditions</legend><div id="conds"></div></fieldset><fieldset class="tbsection"><legend>Perform these actions</legend><div id="acts"></div></fieldset>`}
 function setMode(mode){const x=document.querySelector(`input[name="mm"][value="${mode||"all"}"]`)||document.querySelector('input[name="mm"][value="all"]');x.checked=true;const all=x.value==="matchAll"||x.value==="finalCatchAll";$("#conds").style.opacity=all?".4":"1";$("#conds").style.pointerEvents=all?"none":"auto"}
 function wireMode(){document.querySelectorAll('input[name="mm"]').forEach(x=>x.onchange=()=>setMode(x.value))}
-function openEdit(id){const r=findRule(id);if(!r)return;editingId=id;$("#dtitle").textContent="Edit Filter: "+friendly(r.name);$("#dbody").innerHTML=editorMarkup();$("#ename").value=r.name||"";$("#een").checked=r.enabled!==false;$("#conds").replaceChildren();$("#acts").replaceChildren();(r.conditions||[]).forEach(c=>$("#conds").append(condRow(c)));if(!$("#conds").children.length)$("#conds").append(condRow());(r.actions||[]).forEach(a=>$("#acts").append(actRow(a)));if(!$("#acts").children.length)$("#acts").append(actRow());setMode(r.finalCatchAll?"finalCatchAll":(r.matchMode||"all"));wireMode();$("#modal").classList.add("open")}
-function openNewRule(){editingId="__NEW__";$("#dtitle").textContent="Add Filter";$("#dbody").innerHTML=editorMarkup();$("#ename").value="New Rule";$("#een").checked=false;$("#conds").replaceChildren(condRow());$("#acts").replaceChildren(actRow());setMode("all");wireMode();$("#modal").classList.add("open")}
+function openEdit(id){const r=findRule(id);if(!r)return;editingId=id;$("#dtitle").textContent="Edit Filter: "+friendly(r.name);$("#dbody").innerHTML=editorMarkup();$("#ename").value=r.name||"";$("#een").checked=r.enabled!==false;$("#conds").replaceChildren();$("#acts").replaceChildren();(r.conditions||[]).forEach(c=>$("#conds").append(condRow(c)));if(!$("#conds").children.length)$("#conds").append(condRow());(r.actions||[]).forEach(a=>$("#acts").append(actRow(a)));if(!$("#acts").children.length)$("#acts").append(actRow());setMode(r.finalCatchAll?"finalCatchAll":(r.matchMode||"all"));mo28SetAccountChecks(r.accountIds);wireMode();$("#modal").classList.add("open")}
+function openNewRule(){editingId="__NEW__";$("#dtitle").textContent="Add Filter";$("#dbody").innerHTML=editorMarkup();$("#ename").value="New Rule";$("#een").checked=false;$("#conds").replaceChildren(condRow());$("#acts").replaceChildren(actRow());setMode("all");mo28SetAccountChecks([]);wireMode();$("#modal").classList.add("open")}
 function collectEditorRule(existing){
  const mode=document.querySelector('input[name="mm"]:checked')?.value||"all";
  const conditions=(mode==="matchAll"||mode==="finalCatchAll")?[]:[...$("#dbody").querySelectorAll(".cond")].map(r=>{const field=r.querySelector(".f").value,operator=r.querySelector(".o").value,value=r.querySelector(".v").value;const c={field,operator,value};if(operator==="inAddressBook"||operator==="notInAddressBook")c.addressBookName=value;if(operator==="inMailingList"||operator==="notInMailingList")c.mailingListName=value;return c});
- const actions=[...$("#dbody").querySelectorAll(".act")].map(r=>{const type=r.querySelector(".t").value,value=r.querySelector(".v")?.value||"";if(type==="move"||type==="copy")return{type,folderId:value};if(type==="tag")return{type,tagKey:value};if(type==="priority"||type==="junk")return{type,value};return{type}});
- return{id:existing?.id||crypto.randomUUID(),name:$("#ename").value.trim()||"New Rule",enabled:$("#een").checked,matchMode:mode,finalCatchAll:mode==="finalCatchAll",conditions,actions}
+ const actions=[...$("#dbody").querySelectorAll(".act")].map(r=>{const type=r.querySelector(".t").value,value=r.querySelector(".v")?.value||"";if(type==="move"||type==="copy")return{type,folderId:value,folderMap:{...(r.mo28FolderMap||{})}};if(type==="tag")return{type,tagKey:value};if(type==="priority"||type==="junk")return{type,value};return{type}});
+ return{...(existing||{}),id:existing?.id||crypto.randomUUID(),name:$("#ename").value.trim()||"New Rule",enabled:$("#een").checked,matchMode:mode,finalCatchAll:mode==="finalCatchAll",conditions,actions,accountIds:[...document.querySelectorAll(".mo28Account:checked")].map(x=>x.value)}
 }
 function validateRuleDraft(draft,mode="save"){
  if(!draft.name.trim())return"Enter a filter name.";
@@ -560,8 +588,63 @@ async function exportSenderAddresses(){
   wrap.querySelector("#esaCsv").onclick=()=>{const v=render(), cols=["email","name","count","inExcludedBook","lastDate"];const csv=[cols.join(","),...v.map(x=>cols.map(k=>'"'+String(x[k]??"").replaceAll('"','""')+'"').join(","))].join("\r\n");saveTextFile(`MailOrganizer-SenderAddresses-${fileStamp()}.csv`,csv,"text/csv");};
 }
 
+// .28: search results stay in the existing filter list, and additions are edited before saving.
+function mo28AddSearchCondition(){
+ const term=String($("#search")?.value||"").trim();
+ if(!term)return show("Enter a condition value in the search box first.");
+ if(selectedIds.size>1)return show("Highlight only one filter before adding a condition.");
+ const id=selectedId&&findRule(selectedId)?selectedId:null;
+ const fields=["from","to","subject","body"];
+ const pick=prompt("Choose condition field:\\n1. From\\n2. To\\n3. Subject\\n4. Body","1");
+ if(pick===null)return;
+ const field=fields[Number(pick)-1];
+ if(!field)return show("Invalid condition field.");
+ const target=id?findRule(id):null;
+ if(target && (target.conditions||[]).some(c=>String(c.field)===field&&String(c.operator)==="contains"&&String(c.value||"").trim().toLowerCase()===term.toLowerCase()))return show("That condition already exists in "+target.name+".");
+ if(target){
+   if(target.matchMode==="matchAll"||target.matchMode==="finalCatchAll"){
+     if(!confirm("This filter matches all messages. Change it to ANY conditions before adding the new condition?"))return;
+   }else if(target.matchMode!=="any" && !confirm("This filter currently requires ALL conditions. Keep ALL logic?\\nOK = keep ALL; Cancel = use ANY (OR).")) {
+     openEdit(id);setMode("any");$("#conds").append(condRow({field,operator:"contains",value:term}));return;
+   }
+   openEdit(id);
+   if(target.matchMode==="matchAll"||target.matchMode==="finalCatchAll")setMode("any");
+ }else{
+   if(!confirm("No single filter selected. Create a NEW filter with this condition?"))return;
+   openNewRule();
+   $("#ename").value="From contains: "+term;
+   $("#conds").replaceChildren();
+ }
+ $("#conds").append(condRow({field,operator:"contains",value:term}));
+ show("Condition added to editor. Review AND/OR and actions, then click Save.");
+}
+function mo28ExportRules(){
+ const exportData={format:"MailOrganizerRules",version:messenger.runtime.getManifest().version,exportedAt:new Date().toISOString(),rules:structuredClone(rules)};
+ saveTextFile("MailOrganizer-Filters-"+fileStamp()+".json",JSON.stringify(exportData,null,2),"application/json");
+ show("Exported "+rules.length+" filters to searchable JSON.");
+}
+async function mo28CreateFolder(){
+ if(!folders.length)await refreshFolders(false);
+ const parentChoices=folders.filter(f=>!f.isAccount);
+ const current=$("#folder")?.value||"";
+ const chosen=parentChoices.find(f=>String(f.id)===String(current));
+ const parent=chosen||parentChoices[0];
+ if(!parent)return show("No parent folder available.");
+ const parentId=prompt("Parent Thunderbird folder ID (default: selected folder).\\nChoose the parent using the folder dropdown first if needed.",parent.id);
+ if(parentId===null)return;
+ const name=prompt("Name of the new Thunderbird subfolder under "+(folders.find(f=>String(f.id)===parentId)?.name||parentId)+":","");
+ if(name===null||!name.trim())return;
+ const response=await messenger.runtime.sendMessage({type:"mo28CreateFolder",parentId,name});
+ if(!response?.ok)return show("Folder creation failed: "+(response?.error||"unknown error"));
+ await refreshFolders(false);
+ show("Created Thunderbird folder: "+name);
+}
 function bindStaticControls() {
   $("#search").addEventListener("input", render);
+  $("#searchScope")?.addEventListener("change",render);
+  $("#addSearchCondition")?.addEventListener("click",mo28AddSearchCondition);
+  $("#exportRules")?.addEventListener("click",mo28ExportRules);
+  $("#createTBFolder")?.addEventListener("click",()=>void mo28CreateFolder());
   $("#refreshFolders")?.addEventListener("click",()=>refreshFolders(true));
   $("#unmatched")?.addEventListener("click",openUnmatched);
   $("#exportSenders")?.addEventListener("click",exportSenderAddresses);
@@ -917,6 +1000,7 @@ async function refreshFolders(showStatus=true){
   try{
     const result=await messenger.runtime.sendMessage({type:"getFolders"});
     folders=Array.isArray(result?.folders)?result.folders:[];
+    mo28Accounts=folders.filter(f=>f.isAccount).map(f=>({id:f.accountId,name:f.name.replace(/ — All folders.*$/,"")}));
     if(mainFolder){
       mainFolder.innerHTML='<option value="">Choose one folder...</option>'+folders.map(f=>`<option value="${esc(f.id)}">${esc(f.name)}</option>`).join("");
       if([...mainFolder.options].some(o=>o.value===keepMain)) mainFolder.value=keepMain;
