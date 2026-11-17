@@ -441,9 +441,17 @@ async function mo22VerifyMove(message,destinationId,sourceFolderId,returned){
     return {status:"VERIFIED",source:"UNKNOWN",destination:"RETURNED"};
   if(returnedId && String(returnedId)!==String(destinationId))
     return {status:"FAILED",source:"UNKNOWN",destination:"MISMATCH"};
+  // Thunderbird may return a new message ID after moving mail.
+  const returnedMessageId=returnedItems[0]?.id||returned?.id;
+  if(returnedMessageId){
+    try{
+      const moved=await messenger.messages.get(returnedMessageId);
+      if(String(moved?.folder?.id||"")===String(destinationId))return {status:"VERIFIED",source:"UNKNOWN",destination:"GET_BY_RETURNED_ID"};
+    }catch(e){}
+  }
   await mo19Sleep(750);
   const source=await mo20CheckSource(message,sourceFolderId);
-  return {status:source==="PRESENT"?"STILL IN SOURCE":"UNVERIFIED",source,destination:"NOT_CHECKED"};
+  return {status:source==="PRESENT"?"STILL IN SOURCE":"UNVERIFIED",source,destination:"NOT_CONFIRMED"};
 }
 async function mo22VerifyAndLogMove(message,action,rule,logContext,requested,returned){
   const base={kind:"ACTION",mode:logContext.mode||"Manual Run",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||""};
@@ -672,7 +680,7 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
 // Incoming mail can be announced before an IMAP message has completely settled.
 // Queue new messages, allow Thunderbird a short settling interval, then re-fetch
 // the message before matching. A single worker prevents overlapping live runs.
-const INCOMING_SETTLE_MS = 1500;
+const INCOMING_SETTLE_MS = 4000;
 // On extension startup, let Thunderbird finish its first IMAP sync burst.
 const MO23_STARTUP_READY_AT = Date.now() + 10000;
 const MO23_BATCH_SIZE = 25;
@@ -681,6 +689,29 @@ const INCOMING_RETRY_MS = 2000;
 const INCOMING_MAX_FETCH_ATTEMPTS = 3;
 const incomingQueue = [];
 const incomingQueuedIds = new Set();
+// Persist only queue metadata; never duplicate or move mail into a staging folder.
+const MO27_QUEUE_KEY="mo27PendingQueue";
+let mo27QueueReady=false;
+let mo27QueueWrite=Promise.resolve();
+function mo27PersistQueue(){
+  const snapshot=[...incomingQueue,...(mo25CurrentItem?[mo25CurrentItem]:[])].map(x=>({messageId:x.messageId,folderId:x.folder?.id,folderName:x.folder?.name,subject:x.subject,author:x.author,readyAt:x.readyAt,recovery:!!x.recovery})).filter(x=>x.folderId);
+  mo27QueueWrite=mo27QueueWrite.then(()=>messenger.storage.local.set({[MO27_QUEUE_KEY]:snapshot})).catch(e=>console.warn("Queue persistence failed",e));
+  return mo27QueueWrite;
+}
+let mo25CurrentItem=null;
+async function mo27RestoreQueue(){
+  try{
+    const stored=await messenger.storage.local.get({[MO27_QUEUE_KEY]:[]});
+    for(const x of stored[MO27_QUEUE_KEY]||[]){
+      if(!x?.messageId||!x.folderId||incomingQueuedIds.has(String(x.messageId)))continue;
+      incomingQueuedIds.add(String(x.messageId));
+      incomingQueue.push({messageId:x.messageId,folder:{id:x.folderId,name:x.folderName||"Inbox"},subject:x.subject||"",author:x.author||"",readyAt:Math.max(Date.now()+1000,Number(x.readyAt)||0),recovery:true});
+    }
+  }catch(e){console.warn("Queue restore failed",e);}
+  mo27QueueReady=true;
+  if(incomingQueue.length)void runIncomingWorker();
+}
+void mo27RestoreQueue();
 let incomingWorkerRunning = false;
 let activeManualRuns = 0;
 
@@ -703,13 +734,15 @@ async function fetchIncomingMessageWithRetry(messageId, folderName){
 }
 
 async function runIncomingWorker(){
-  if(incomingWorkerRunning) return;
+  if(incomingWorkerRunning || !mo27QueueReady) return;
   incomingWorkerRunning=true;
   try{
     let batchState=null, batchCount=0;
     while(incomingQueue.length){
       const item=incomingQueue.shift();
+      mo25CurrentItem=item;
       mo25CurrentMessageId=item.messageId;
+      await mo27PersistQueue();
       try{
         // Manual Run gets exclusive use of message actions. Incoming mail waits
         // rather than racing a user-initiated batch over the same folders.
@@ -758,6 +791,8 @@ async function runIncomingWorker(){
       }finally{
         incomingQueuedIds.delete(String(item.messageId));
         mo25CurrentMessageId=null;
+        mo25CurrentItem=null;
+        await mo27PersistQueue();
       }
     }
   }finally{
@@ -826,6 +861,7 @@ async function mo24Reconcile(){
           mo24Observe(id);
           incomingQueuedIds.add(id);
           incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS,recovery:true});
+          await mo27PersistQueue();
           recoveryQueued++;
           await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"RECOVERY QUEUED",rule:"",action:"Queue for live filters",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder.name||"Inbox",detail:"Message not observed in live listener; queued for normal enabled rules. Thunderbird folder checked again before actions."});
         }
@@ -863,6 +899,7 @@ messenger.messages.onNewMailReceived.addListener(async (folder, messageList) => 
       if(incomingQueuedIds.has(key)) continue;
       incomingQueuedIds.add(key);
       incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS});
+      await mo27PersistQueue();
       await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"QUEUED",rule:"",action:"Queue",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder?.name||"",detail:`Waiting ${INCOMING_SETTLE_MS} ms before re-fetch and filter evaluation.`});
     }
     if(!page.id) break;
