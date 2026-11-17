@@ -608,6 +608,7 @@ function mo28AddSearchCondition(){
      openEdit(id);setMode("any");$("#conds").append(condRow({field,operator:"contains",value:term}));return;
    }
    openEdit(id);
+   if(!(target.conditions||[]).length)$("#conds").replaceChildren();
    if(target.matchMode==="matchAll"||target.matchMode==="finalCatchAll")setMode("any");
  }else{
    if(!confirm("No single filter selected. Create a NEW filter with this condition?"))return;
@@ -628,10 +629,9 @@ async function mo28CreateFolder(){
  const parentChoices=folders.filter(f=>!f.isAccount);
  const current=$("#folder")?.value||"";
  const chosen=parentChoices.find(f=>String(f.id)===String(current));
- const parent=chosen||parentChoices[0];
- if(!parent)return show("No parent folder available.");
- const parentId=prompt("Parent Thunderbird folder ID (default: selected folder).\\nChoose the parent using the folder dropdown first if needed.",parent.id);
- if(parentId===null)return;
+ const parent=chosen;
+ if(!parent)return show("Select the parent folder in the folder dropdown before creating a Thunderbird subfolder.");
+ const parentId=parent.id;
  const name=prompt("Name of the new Thunderbird subfolder under "+(folders.find(f=>String(f.id)===parentId)?.name||parentId)+":","");
  if(name===null||!name.trim())return;
  const response=await messenger.runtime.sendMessage({type:"mo28CreateFolder",parentId,name});
@@ -639,12 +639,44 @@ async function mo28CreateFolder(){
  await refreshFolders(false);
  show("Created Thunderbird folder: "+name);
 }
+async function mo28RunAccountInboxes(){
+ const ids=resolveSelectedRuleIds();
+ const chosen=ids.map(findRule).filter(r=>r&&r.enabled!==false);
+ if(!chosen.length)return show("Highlight one or more ENABLED filters first.");
+ for(const r of chosen){const error=storedRuleValidation(r,"run");if(error)return show("Cannot run "+r.name+": "+error);}
+ await refreshFolders(false);
+ const accounts=mo28Accounts;
+ if(!accounts.length)return show("No Thunderbird accounts found.");
+ const selection=prompt("Select account numbers, separated by commas, whose INBOXES should be processed:\\n"+accounts.map((a,i)=>(i+1)+". "+a.name).join("\\n"),accounts.map((_,i)=>i+1).join(","));
+ if(selection===null)return;
+ const picks=[...new Set(selection.split(",").map(x=>Number(x.trim())-1))];
+ if(!picks.length||picks.some(n=>!Number.isInteger(n)||n<0||n>=accounts.length))return show("Invalid account selection.");
+ const targets=[];
+ for(const n of picks){
+   const a=accounts[n];
+   const inbox=folders.find(f=>!f.isAccount&&String(f.accountId)===String(a.id)&&(/: Inbox$/i.test(f.name)||/\\/Inbox$/i.test(f.name)));
+   if(!inbox)return show("No Inbox found for "+a.name+". No filters were run.");
+   targets.push({account:a,folder:inbox});
+ }
+ if(!confirm("MANUAL MULTI-ACCOUNT RUN\\n\\nAccounts: "+targets.map(x=>x.account.name).join(", ")+"\\nFilters: "+chosen.map(x=>x.name).join(", ")+"\\n\\nThis will process ALL messages in each selected Inbox and can MOVE or DELETE mail. Continue?"))return;
+ const summary=[];
+ for(const target of targets){
+   show("Running "+chosen.length+" filter(s) on "+target.folder.name+"...");
+   try{
+     const result=await messenger.runtime.sendMessage({type:"runFolder",folderId:target.folder.id,folderName:target.folder.name,ruleIds:chosen.map(x=>x.id),maxMessages:null,progressToken:crypto.randomUUID()});
+     summary.push(target.account.name+": scanned "+(result?.count??0)+", matched "+(result?.matchedMessages??0)+", errors "+(result?.errors??0));
+     if(result?.errors){summary.push("Stopped after errors; check Activity Log.");break;}
+   }catch(e){summary.push(target.account.name+": ERROR "+(e.message||e));break;}
+ }
+ show("Multi-account run complete. "+summary.join(" | "));
+}
 function bindStaticControls() {
   $("#search").addEventListener("input", render);
   $("#searchScope")?.addEventListener("change",render);
   $("#addSearchCondition")?.addEventListener("click",mo28AddSearchCondition);
   $("#exportRules")?.addEventListener("click",mo28ExportRules);
   $("#createTBFolder")?.addEventListener("click",()=>void mo28CreateFolder());
+  $("#multiAccountRun")?.addEventListener("click",()=>void mo28RunAccountInboxes());
   $("#refreshFolders")?.addEventListener("click",()=>refreshFolders(true));
   $("#unmatched")?.addEventListener("click",openUnmatched);
   $("#exportSenders")?.addEventListener("click",exportSenderAddresses);
@@ -1067,6 +1099,12 @@ async function startup() {
   }
 
   await refreshFolders(false);
+  // One-time safety snapshot of the rules that existed before .28 edits.
+  const baseline=await messenger.storage.local.get({mo28BaselineSaved:false});
+  if(!baseline.mo28BaselineSaved){
+    await messenger.runtime.sendMessage({type:"mo28BackupRules"});
+    await messenger.storage.local.set({mo28BaselineSaved:true});
+  }
 
   render();
   wiringCheck();
