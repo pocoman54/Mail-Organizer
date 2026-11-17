@@ -601,7 +601,7 @@ function mo28AddSearchCondition(){
  const field=fields[Number(pick)-1];
  if(!field)return show("Invalid condition field.");
  const target=id?findRule(id):null;
- if(target && (target.conditions||[]).some(c=>String(c.field)===field&&["contains","oneOf","is"].includes(String(c.operator))&&String(c.value||"").split(/[\\n,;]+/).some(x=>x.trim().toLowerCase()===term.toLowerCase())))return show("That condition already exists in "+target.name+".");
+ if(target && (target.conditions||[]).some(c=>String(c.field)===field&&["contains","oneOf","is"].includes(String(c.operator))&&String(c.value||"").split(/[\n,;]+/).some(x=>x.trim().toLowerCase()===term.toLowerCase())))return show("That condition already exists in "+target.name+".");
  if(target){
    if(target.matchMode==="matchAll"||target.matchMode==="finalCatchAll"){
      if(!confirm("This filter matches all messages. Change it to ANY conditions before adding the new condition?"))return;
