@@ -428,13 +428,13 @@ function actRow(a={}){
  d.querySelector(".mo28Map").onclick=()=>{
    if(t.value!=="move"&&t.value!=="copy")return alert("Account destination mapping is available for Move and Copy actions.");
    if(!mo28Accounts.length)return alert("No Thunderbird accounts found.");
-   const menu=mo28Accounts.map((x,i)=>(i+1)+". "+x.name).join("\\n");
-   const accountPick=prompt("Choose account number to map (Cancel to leave unchanged):\\n"+menu,"1");
+   const menu=mo28Accounts.map((x,i)=>(i+1)+". "+x.name).join("\n");
+   const accountPick=prompt("Choose account number to map (Cancel to leave unchanged):\n"+menu,"1");
    if(accountPick===null)return;
    const account=mo28Accounts[Number(accountPick)-1];if(!account)return alert("Invalid account number.");
    const candidates=folders.filter(f=>!f.isAccount&&String(f.accountId)===String(account.id));
-   const folderMenu=candidates.map((f,i)=>(i+1)+". "+f.name).join("\\n");
-   const choice=prompt("Destination in "+account.name+" (enter 0 to clear mapping):\\n"+folderMenu,"1");
+   const folderMenu=candidates.map((f,i)=>(i+1)+". "+f.name).join("\n");
+   const choice=prompt("Destination in "+account.name+" (enter 0 to clear mapping):\n"+folderMenu,"1");
    if(choice===null)return;
    if(choice.trim()==="0")delete d.mo28FolderMap[account.id];
    else {const folder=candidates[Number(choice)-1];if(!folder)return alert("Invalid folder number.");d.mo28FolderMap[account.id]=folder.id;}
