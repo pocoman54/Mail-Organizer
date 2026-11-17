@@ -766,8 +766,8 @@ async function runIncomingWorker(){
         const remaining=Math.max(0, item.readyAt-Date.now());
         if(remaining) await sleep(remaining);
         const message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
-        if(item.recovery && String(message.folder?.id||"")!==String(item.folder?.id||"")){
-          await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SKIPPED MOVED",rule:"",action:"Skip",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message no longer in the original Inbox; not processed again."});
+        if(String(message.folder?.id||"")!==String(item.folder?.id||"")){
+          await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SKIPPED MOVED",rule:"",action:"Skip",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message no longer in original source folder; not processed again."});
           continue;
         }
         await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"PROCESSING",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Settling delay complete; message re-fetched from Thunderbird."});
