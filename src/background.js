@@ -470,6 +470,13 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
         continue;
       }
       if (action.type === "move") {
+        const sourceId=String(logContext.folderId||message.folder?.id||"");
+        if(sourceId && sourceId===String(action.folderId)){
+          const label=await mo46FolderLabel(action.folderId);
+          results.push(`Already in destination: ${label}`);
+          await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"ALREADY IN DESTINATION",rule:rule.name||"",action:"Move skipped",destination:label,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"No Thunderbird move called. Continue to subsequent filters."});
+          continue;
+        }
         const requested=await mo46FolderLabel(action.folderId);
         await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"MOVE REQUESTED",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Thunderbird move requested; verifying destination."});
         const moveReturned=await messenger.messages.move([message.id], action.folderId);
@@ -539,6 +546,7 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
       results.push(`ERROR: ${e.message || e}`);
       let destination=""; try { if(action.type==="move"||action.type==="copy") destination=await mo46FolderLabel(action.folderId); else if(action.type==="tag") destination=String(action.tagKey||""); } catch {}
       await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"FAILED",rule:rule.name||"",action:actionLabel(action),destination,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:e.message||String(e)});
+      e.mo26ActionLogged=true;
       throw e;
     }
   }
@@ -602,6 +610,19 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
     // A final catch-all is special: it is eligible only when no earlier rule matched.
     if (isFinalCatchAll && matches.length) continue;
     if (!(await ruleMatches(message, rule))) continue;
+    if(!simulate){
+      try{
+        const current=await messenger.messages.get(message.id);
+        const expected=String(sourceFolder?.id||message.folder?.id||"");
+        if(!current || (expected && String(current.folder?.id||"")!==expected)){
+          await addLog({kind:"ACTION",mode,status:"SKIPPED MOVED",rule:rule.name||"",action:"Recheck",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:sourceFolder?.name||"",detail:"Message no longer in the original source folder; no further actions."});
+          break;
+        }
+      }catch(e){
+        await addLog({kind:"ACTION",mode,status:"SKIPPED MISSING",rule:rule.name||"",action:"Recheck",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:sourceFolder?.name||"",detail:"Message not available for further actions: "+String(e?.message||e)});
+        break;
+      }
+    }
     matches.push(rule.name);
     if (isOrganizationalRule(rule)) organizationalMatched = true;
     if(!simulate) await recordFilterMatch(rule,message,sourceFolder);
@@ -620,7 +641,7 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
         });
       }
     } catch (e) {
-      await addLog({
+      if(!e.mo26ActionLogged) await addLog({
         status: "FAILED", rule: rule.name, subject: message.subject || "",
         author: message.author || "", folder: sourceFolder?.name || "",
         detail: e.message || String(e)
@@ -745,7 +766,7 @@ async function runIncomingWorker(){
   }
 }
 
-// .24 diagnostic-only reconciliation. Never moves, marks or otherwise changes mail.
+// .25 live recovery scan: queues missed Inbox messages for normal filtering.
 // A candidate means no live queue event was observed by this extension session;
 // it does NOT establish that a filter would match.
 const MO24_SCAN_INTERVAL_MS=60000;
