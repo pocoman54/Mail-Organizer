@@ -9,6 +9,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({
 let rules = [];
 let folders = [];
 let mo28Accounts = [];
+let mo28RulesChangedDuringEdit=false;
 let selectedId = null;
 let selectedIds = new Set();
 let selectionAnchorId = null;
@@ -451,8 +452,8 @@ function mo28SetAccountChecks(ids){
 function editorMarkup(){return`<div class="line"><label>Filter Name</label><input id="ename"></div><div class="line"><label>Enabled</label><label><input id="een" type="checkbox"> Run this filter</label></div><div class="tbmatch"><b>Match:</b><label><input type="radio" name="mm" value="all" checked> all of the following</label><label><input type="radio" name="mm" value="any"> any of the following</label><label><input type="radio" name="mm" value="matchAll"> all messages</label><label title="Runs only if no earlier filter matched"><input type="radio" name="mm" value="finalCatchAll"> final catch-all</label></div>${mo28AccountMarkup()}<fieldset class="tbsection"><legend>Conditions</legend><div id="conds"></div></fieldset><fieldset class="tbsection"><legend>Perform these actions</legend><div id="acts"></div></fieldset>`}
 function setMode(mode){const x=document.querySelector(`input[name="mm"][value="${mode||"all"}"]`)||document.querySelector('input[name="mm"][value="all"]');x.checked=true;const all=x.value==="matchAll"||x.value==="finalCatchAll";$("#conds").style.opacity=all?".4":"1";$("#conds").style.pointerEvents=all?"none":"auto"}
 function wireMode(){document.querySelectorAll('input[name="mm"]').forEach(x=>x.onchange=()=>setMode(x.value))}
-function openEdit(id){const r=findRule(id);if(!r)return;editingId=id;$("#dtitle").textContent="Edit Filter: "+friendly(r.name);$("#dbody").innerHTML=editorMarkup();$("#ename").value=r.name||"";$("#een").checked=r.enabled!==false;$("#conds").replaceChildren();$("#acts").replaceChildren();(r.conditions||[]).forEach(c=>$("#conds").append(condRow(c)));if(!$("#conds").children.length)$("#conds").append(condRow());(r.actions||[]).forEach(a=>$("#acts").append(actRow(a)));if(!$("#acts").children.length)$("#acts").append(actRow());setMode(r.finalCatchAll?"finalCatchAll":(r.matchMode||"all"));mo28SetAccountChecks(r.accountIds);wireMode();$("#modal").classList.add("open")}
-function openNewRule(){editingId="__NEW__";$("#dtitle").textContent="Add Filter";$("#dbody").innerHTML=editorMarkup();$("#ename").value="New Rule";$("#een").checked=false;$("#conds").replaceChildren(condRow());$("#acts").replaceChildren(actRow());setMode("all");mo28SetAccountChecks([]);wireMode();$("#modal").classList.add("open")}
+function openEdit(id){const r=findRule(id);if(!r)return;mo28RulesChangedDuringEdit=false;editingId=id;$("#dtitle").textContent="Edit Filter: "+friendly(r.name);$("#dbody").innerHTML=editorMarkup();$("#ename").value=r.name||"";$("#een").checked=r.enabled!==false;$("#conds").replaceChildren();$("#acts").replaceChildren();(r.conditions||[]).forEach(c=>$("#conds").append(condRow(c)));if(!$("#conds").children.length)$("#conds").append(condRow());(r.actions||[]).forEach(a=>$("#acts").append(actRow(a)));if(!$("#acts").children.length)$("#acts").append(actRow());setMode(r.finalCatchAll?"finalCatchAll":(r.matchMode||"all"));mo28SetAccountChecks(r.accountIds);wireMode();$("#modal").classList.add("open")}
+function openNewRule(){mo28RulesChangedDuringEdit=false;editingId="__NEW__";$("#dtitle").textContent="Add Filter";$("#dbody").innerHTML=editorMarkup();$("#ename").value="New Rule";$("#een").checked=false;$("#conds").replaceChildren(condRow());$("#acts").replaceChildren(actRow());setMode("all");mo28SetAccountChecks([]);wireMode();$("#modal").classList.add("open")}
 function collectEditorRule(existing){
  const mode=document.querySelector('input[name="mm"]:checked')?.value||"all";
  const conditions=(mode==="matchAll"||mode==="finalCatchAll")?[]:[...$("#dbody").querySelectorAll(".cond")].map(r=>{const field=r.querySelector(".f").value,operator=r.querySelector(".o").value,value=r.querySelector(".v").value;const c={field,operator,value};if(operator==="inAddressBook"||operator==="notInAddressBook")c.addressBookName=value;if(operator==="inMailingList"||operator==="notInMailingList")c.mailingListName=value;return c});
@@ -788,6 +789,10 @@ function bindStaticControls() {
   });
 
   $("#saveEdit").addEventListener("click", async () => {
+    if(mo28RulesChangedDuringEdit){
+      alert("The stored filter list changed while this editor was open (possibly a Thunderbird folder rename). Close and reopen the filter before saving.");
+      return;
+    }
     const existing = editingId === "__NEW__" ? null : findRule(editingId);
     const draft = collectEditorRule(existing);
     const problem = validateRuleDraft(draft, "save");
@@ -1057,6 +1062,16 @@ async function refreshFolders(showStatus=true){
 
 async function startup() {
   bindStaticControls();
+  messenger.storage.onChanged.addListener((changes,area)=>{
+    if(area!=="local"||!changes.rules||!Array.isArray(changes.rules.newValue))return;
+    if($("#modal")?.classList.contains("open")){
+      mo28RulesChangedDuringEdit=true;
+      return;
+    }
+    rules=structuredClone(changes.rules.newValue);
+    startupStoredCount=rules.length;
+    render();
+  });
 
   // Always display the installed extension version from manifest.json.
   // This prevents the UI label from drifting out of sync with the package version.
