@@ -655,7 +655,7 @@ async function mo28RunAccountInboxes(){
  const targets=[];
  for(const n of picks){
    const a=accounts[n];
-   const inbox=folders.find(f=>!f.isAccount&&String(f.accountId)===String(a.id)&&(/: Inbox$/i.test(f.name)||/\\/Inbox$/i.test(f.name)));
+   const inbox=folders.find(f=>!f.isAccount&&String(f.accountId)===String(a.id)&&(String(f.name).toLowerCase().endsWith(": inbox")||String(f.name).toLowerCase().endsWith("/inbox")));
    if(!inbox)return show("No Inbox found for "+a.name+". No filters were run.");
    targets.push({account:a,folder:inbox});
  }
