@@ -505,7 +505,7 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
         void mo22VerifyAndLogMove(message,action,rule,logContext,requested,moveReturned);
         results.push(`Move requested → ${requested} [${action.folderId}]; verification pending`);
         results.stopProcessing=true;
-        const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(action)+1);
+        const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(originalAction)+1);
         if(remaining[0]?.type==="stop"){
           await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"SUCCESS",rule:rule.name||"",action:"Stop Filter Execution",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Stop after move"});
         }
@@ -559,7 +559,7 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
       await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"SUCCESS",rule:rule.name||"",action:actionLabel(action),destination,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:results[results.length-1]||"Completed"});
       if (action.type === "stop" || action.type === "delete" || action.type === "archive") break;
       if (action.type === "move") {
-        const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(action)+1);
+        const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(originalAction)+1);
         const next=remaining[0];
         if(next?.type!=="stop") break;
       }
