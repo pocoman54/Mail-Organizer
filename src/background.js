@@ -485,6 +485,15 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
     const mapped=originalAction.folderMap?.[accountId];
     const action=(mapped && (originalAction.type==="move"||originalAction.type==="copy"))?{...originalAction,folderId:mapped}:originalAction;
     try {
+      if((action.type==="move"||action.type==="copy")&&!simulate){
+        const sourceAccount=String(message.folder?.accountId||logContext.accountId||"");
+        if(sourceAccount && messenger.folders?.get){
+          const destinationFolder=await messenger.folders.get(action.folderId);
+          if(!destinationFolder)throw new Error("Destination folder not found.");
+          if(destinationFolder.accountId && String(destinationFolder.accountId)!==sourceAccount)
+            throw new Error("CROSS-ACCOUNT MOVE BLOCKED: map a destination in the source account before running this filter.");
+        }
+      }
       if (simulate) {
         results.push(`SIMULATE ${action.type}`);
         if (action.type === "stop" || action.type === "move" || action.type === "delete" || action.type === "archive") results.stopProcessing = true;
