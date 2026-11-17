@@ -594,14 +594,14 @@ function mo28AddSearchCondition(){
  const term=String($("#search")?.value||"").trim();
  if(!term)return show("Enter a condition value in the search box first.");
  if(selectedIds.size>1)return show("Highlight only one filter before adding a condition.");
- const id=selectedId&&findRule(selectedId)?selectedId:null;
+ const id=selectedId&&findRule(selectedId)&&[...$("#rows").children].some(row=>row.dataset.id===String(selectedId))?selectedId:null;
  const fields=["from","to","subject","body"];
  const pick=prompt("Choose condition field:\\n1. From\\n2. To\\n3. Subject\\n4. Body","1");
  if(pick===null)return;
  const field=fields[Number(pick)-1];
  if(!field)return show("Invalid condition field.");
  const target=id?findRule(id):null;
- if(target && (target.conditions||[]).some(c=>String(c.field)===field&&String(c.operator)==="contains"&&String(c.value||"").trim().toLowerCase()===term.toLowerCase()))return show("That condition already exists in "+target.name+".");
+ if(target && (target.conditions||[]).some(c=>String(c.field)===field&&["contains","oneOf","is"].includes(String(c.operator))&&String(c.value||"").split(/[\\n,;]+/).some(x=>x.trim().toLowerCase()===term.toLowerCase())))return show("That condition already exists in "+target.name+".");
  if(target){
    if(target.matchMode==="matchAll"||target.matchMode==="finalCatchAll"){
      if(!confirm("This filter matches all messages. Change it to ANY conditions before adding the new condition?"))return;
@@ -783,9 +783,17 @@ function bindStaticControls() {
   $("#cancelSimulation")?.addEventListener("click", async()=>{if(!activeSimulationToken)return;setSimulationProgress({processed:0,total:0,folder:"Cancelling…",cancelled:true});await messenger.runtime.sendMessage({type:"cancelSimulation",token:activeSimulationToken});});
   $("#run").addEventListener("click", () => runSelected(false));
 
-  $("#cancel").addEventListener("click", () => {
+  $("#cancel").addEventListener("click", async () => {
     editingId = null;
     $("#modal").classList.remove("open");
+    if(mo28RulesChangedDuringEdit){
+      const current=await messenger.storage.local.get({rules:[]});
+      rules=structuredClone(current.rules||[]);
+      startupStoredCount=rules.length;
+      mo28RulesChangedDuringEdit=false;
+      render();
+      show("Filters refreshed after external changes.");
+    }
   });
 
   $("#saveEdit").addEventListener("click", async () => {
