@@ -470,7 +470,11 @@ async function mo22VerifyAndLogMove(message,action,rule,logContext,requested,ret
 async function executeActions(message, rule, simulate = false, logContext = {}) {
   const results = [];
   const actionLabel = a => ({move:"Move",copy:"Copy",markRead:"Mark Read",markUnread:"Mark Unread",star:"Add Star",unstar:"Remove Star",tag:"Tag",junk:"Set Junk Status",archive:"Archive",priority:"Set Priority",stop:"Stop Filter Execution",delete:"Delete"}[a?.type] || String(a?.type||"Unknown"));
-  for (const action of (rule.actions || [])) {
+  for (const originalAction of (rule.actions || [])) {
+    // Account-specific destinations are optional; existing actions keep their original destination.
+    const accountId=String(message.folder?.accountId||logContext.accountId||"");
+    const mapped=originalAction.folderMap?.[accountId];
+    const action=(mapped && (originalAction.type==="move"||originalAction.type==="copy"))?{...originalAction,folderId:mapped}:originalAction;
     try {
       if (simulate) {
         results.push(`SIMULATE ${action.type}`);
@@ -614,6 +618,10 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
   const matches = [];
   let organizationalMatched = false;
   for (const rule of rules) {
+    // .28: existing filters remain shared; only explicitly scoped filters are restricted.
+    const scope=Array.isArray(rule.accountIds)?rule.accountIds:[];
+    const accountId=String(message.folder?.accountId||sourceFolder?.accountId||"");
+    if(scope.length && (!accountId || !scope.map(String).includes(accountId)))continue;
     const isFinalCatchAll = !!(rule.finalCatchAll || rule.matchMode==="finalCatchAll");
     // A final catch-all is special: it is eligible only when no earlier rule matched.
     if (isFinalCatchAll && matches.length) continue;
@@ -636,7 +644,7 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
     if(!simulate) await recordFilterMatch(rule,message,sourceFolder);
     let terminalAction = false;
     try {
-      const result = await executeActions(message, rule, simulate, {mode,folder:sourceFolder?.name||"",folderId:sourceFolder?.id||message.folder?.id||""});
+      const result = await executeActions(message, rule, simulate, {mode,folder:sourceFolder?.name||"",folderId:sourceFolder?.id||message.folder?.id||"",accountId:sourceFolder?.accountId||message.folder?.accountId||""});
       terminalAction = !!result.stopProcessing;
       // Real runs are logged action-by-action inside executeActions(), including
       // action and destination. Keep only a clearly labelled summary for simulation.
@@ -921,7 +929,54 @@ async function mo30CollectFolderMessages(folderId){
   return out;
 }
 
+// .28: a durable backup before any automatic folder reference repair.
+async function mo28BackupRules(reason){
+  const st=await messenger.storage.local.get({rules:[],mo28RuleBackups:[]});
+  const backups=Array.isArray(st.mo28RuleBackups)?st.mo28RuleBackups:[];
+  backups.push({date:new Date().toISOString(),reason,rules:structuredClone(st.rules||[])});
+  await messenger.storage.local.set({mo28RuleBackups:backups.slice(-10)});
+}
+async function mo28RepairFolderReference(oldFolder,newFolder,eventName){
+  if(!oldFolder?.id||!newFolder?.id)return;
+  const oldId=String(oldFolder.id),newId=String(newFolder.id);
+  if(oldId===newId){mo22FolderLabelCache.clear();return;}
+  const st=await messenger.storage.local.get({rules:[]});
+  const rules=st.rules||[];
+  let changes=0;
+  for(const rule of rules)for(const action of rule.actions||[]){
+    if((action.type!=="move"&&action.type!=="copy"))continue;
+    if(String(action.folderId)===oldId){action.folderId=newId;changes++;}
+    if(action.folderMap)for(const [account,id] of Object.entries(action.folderMap)){
+      if(String(id)===oldId){action.folderMap[account]=newId;changes++;}
+    }
+  }
+  if(!changes)return;
+  await mo28BackupRules(eventName+": "+oldId+" → "+newId);
+  await messenger.storage.local.set({rules});
+  mo22FolderLabelCache.clear();
+  await addLog({kind:"FOLDER",mode:"Folder Maintenance",status:"REFERENCES UPDATED",rule:"",action:eventName,detail:changes+" reference(s) updated: "+oldId+" → "+newId});
+}
+if(messenger.folders?.onRenamed?.addListener)
+  messenger.folders.onRenamed.addListener((oldFolder,newFolder)=>{void mo28RepairFolderReference(oldFolder,newFolder,"Folder renamed").catch(console.error)});
+if(messenger.folders?.onMoved?.addListener)
+  messenger.folders.onMoved.addListener((oldFolder,newFolder)=>{void mo28RepairFolderReference(oldFolder,newFolder,"Folder moved").catch(console.error)});
+
 messenger.runtime.onMessage.addListener(async request => {
+  if(request?.type==="mo28CreateFolder"){
+    const parentId=String(request.parentId||""),name=String(request.name||"").trim();
+    if(!parentId||parentId.startsWith("__ACCOUNT__:"))return {ok:false,error:"Select a real parent folder."};
+    if(!name||name==="."||name===".."||/[\\/]/.test(name))return {ok:false,error:"Enter a valid folder name without slashes."};
+    if(!messenger.folders?.create)return {ok:false,error:"Thunderbird does not expose folder creation to this extension."};
+    try{
+      const created=await messenger.folders.create(parentId,name);
+      mo22FolderLabelCache.clear();
+      return {ok:true,folder:created};
+    }catch(e){return {ok:false,error:String(e?.message||e)};}
+  }
+  if(request?.type==="mo28BackupRules"){
+    await mo28BackupRules("User requested backup");
+    return {ok:true};
+  }
   if(request?.type==="getIncomingHealth"){
     const state=await getState();
     return {ok:true,enabled:!!state.settings?.enabled,workerRunning:incomingWorkerRunning,queued:incomingQueue.length,currentMessageId:mo25CurrentMessageId,lastProgress:mo25LastProgress,lastScan:mo25LastScan,recovered:mo25Recovered,scanRunning:mo24ScanRunning};
