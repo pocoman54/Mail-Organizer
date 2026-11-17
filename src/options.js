@@ -596,7 +596,7 @@ function mo28AddSearchCondition(){
  if(selectedIds.size>1)return show("Highlight only one filter before adding a condition.");
  const id=selectedId&&findRule(selectedId)&&[...$("#rows").children].some(row=>row.dataset.id===String(selectedId))?selectedId:null;
  const fields=["from","to","subject","body"];
- const pick=prompt("Choose condition field:\\n1. From\\n2. To\\n3. Subject\\n4. Body","1");
+ const pick=prompt("Choose condition field:\n1. From\n2. To\n3. Subject\n4. Body","1");
  if(pick===null)return;
  const field=fields[Number(pick)-1];
  if(!field)return show("Invalid condition field.");
@@ -605,7 +605,7 @@ function mo28AddSearchCondition(){
  if(target){
    if(target.matchMode==="matchAll"||target.matchMode==="finalCatchAll"){
      if(!confirm("This filter matches all messages. Change it to ANY conditions before adding the new condition?"))return;
-   }else if(target.matchMode!=="any" && !confirm("This filter currently requires ALL conditions. Keep ALL logic?\\nOK = keep ALL; Cancel = use ANY (OR).")) {
+   }else if(target.matchMode!=="any" && !confirm("This filter currently requires ALL conditions. Keep ALL logic?\nOK = keep ALL; Cancel = use ANY (OR).")) {
      openEdit(id);setMode("any");$("#conds").append(condRow({field,operator:"contains",value:term}));return;
    }
    openEdit(id);
@@ -648,7 +648,7 @@ async function mo28RunAccountInboxes(){
  await refreshFolders(false);
  const accounts=mo28Accounts;
  if(!accounts.length)return show("No Thunderbird accounts found.");
- const selection=prompt("Select account numbers, separated by commas, whose INBOXES should be processed:\\n"+accounts.map((a,i)=>(i+1)+". "+a.name).join("\\n"),accounts.map((_,i)=>i+1).join(","));
+ const selection=prompt("Select account numbers, separated by commas, whose INBOXES should be processed:\n"+accounts.map((a,i)=>(i+1)+". "+a.name).join("\n"),accounts.map((_,i)=>i+1).join(","));
  if(selection===null)return;
  const picks=[...new Set(selection.split(",").map(x=>Number(x.trim())-1))];
  if(!picks.length||picks.some(n=>!Number.isInteger(n)||n<0||n>=accounts.length))return show("Invalid account selection.");
@@ -659,7 +659,7 @@ async function mo28RunAccountInboxes(){
    if(!inbox)return show("No Inbox found for "+a.name+". No filters were run.");
    targets.push({account:a,folder:inbox});
  }
- if(!confirm("MANUAL MULTI-ACCOUNT RUN\\n\\nAccounts: "+targets.map(x=>x.account.name).join(", ")+"\\nFilters: "+chosen.map(x=>x.name).join(", ")+"\\n\\nThis will process ALL messages in each selected Inbox and can MOVE or DELETE mail. Continue?"))return;
+ if(!confirm("MANUAL MULTI-ACCOUNT RUN\n\nAccounts: "+targets.map(x=>x.account.name).join(", ")+"\nFilters: "+chosen.map(x=>x.name).join(", ")+"\n\nThis will process ALL messages in each selected Inbox and can MOVE or DELETE mail. Continue?"))return;
  const summary=[];
  for(const target of targets){
    show("Running "+chosen.length+" filter(s) on "+target.folder.name+"...");
