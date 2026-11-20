@@ -713,6 +713,14 @@ const MO23_BATCH_SIZE = 25;
 const mo23RecentProcessed = new Map();
 const INCOMING_RETRY_MS = 2000;
 const INCOMING_MAX_FETCH_ATTEMPTS = 3;
+// .29: Bound read-only Thunderbird lookups so a stalled IMAP fetch cannot block the entire queue.
+const MO29_FETCH_TIMEOUT_MS = 15000;
+const MO29_RECOVERY_WINDOW_MS = 24*60*60*1000;
+function mo29BoundRead(promise,ms,label){
+  let timer;
+  return Promise.race([Promise.resolve(promise),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timed out after ${ms}ms`)),ms);})]).finally(()=>clearTimeout(timer));
+}
+
 const incomingQueue = [];
 const incomingQueuedIds = new Set();
 // Persist only queue metadata; never duplicate or move mail into a staging folder.
@@ -747,7 +755,7 @@ async function fetchIncomingMessageWithRetry(messageId, folderName){
   let lastError = null;
   for(let attempt=1; attempt<=INCOMING_MAX_FETCH_ATTEMPTS; attempt++){
     try{
-      const message = await messenger.messages.get(messageId);
+      const message = await mo29BoundRead(messenger.messages.get(messageId),MO29_FETCH_TIMEOUT_MS,"Thunderbird message lookup");
       if(message) return message;
       lastError = new Error("Message unavailable");
     }catch(e){ lastError=e; }
@@ -791,6 +799,7 @@ async function runIncomingWorker(){
         if(!realIncoming && !testIncoming) continue;
         const remaining=Math.max(0, item.readyAt-Date.now());
         if(remaining) await sleep(remaining);
+        await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FETCH START",action:"Fetch",messageId:item.messageId,folder:item.folder?.name||"",subject:item.subject||"",author:item.author||"",detail:"MO .29 bounded message lookup; no move has been attempted."});
         const message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
         if(String(message.folder?.id||"")!==String(item.folder?.id||"")){
           await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SKIPPED MOVED",rule:"",action:"Skip",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message no longer in original source folder; not processed again."});
@@ -813,7 +822,7 @@ async function runIncomingWorker(){
         if(item.recovery) mo25Recovered++;
         if(mo23RecentProcessed.size>3000){for(const [k,t] of mo23RecentProcessed){if(t<Date.now()-600000)mo23RecentProcessed.delete(k);}}
       }catch(e){
-        await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FAILED",rule:"",action:"Incoming queue",destination:"",subject:item.subject||"",author:item.author||"",messageId:item.messageId,folder:item.folder?.name||"",detail:e?.message||String(e)});
+        await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FAILED",rule:"",action:"Incoming queue",destination:"",subject:item.subject||"",author:item.author||"",messageId:item.messageId,folder:item.folder?.name||"",detail:`${e?.message||String(e)}; item released, no automatic move retry; recovery audit can inspect source folder.`});
       }finally{
         incomingQueuedIds.delete(String(item.messageId));
         mo25CurrentMessageId=null;
@@ -831,12 +840,13 @@ async function runIncomingWorker(){
 // A candidate means no live queue event was observed by this extension session;
 // it does NOT establish that a filter would match.
 const MO24_SCAN_INTERVAL_MS=60000;
-const MO25_RECOVERY_WINDOW_MS=2*60*60*1000;
+const MO25_RECOVERY_WINDOW_MS=MO29_RECOVERY_WINDOW_MS;
 let mo25LastProgress=Date.now();
 let mo25LastScan=0;
 let mo25Recovered=0;
 let mo25CurrentMessageId=null;
 const MO24_MAX_AGE_MS=24*60*60*1000;
+// .29 recovery scans cover a full day so messages missed during a prolonged stall remain discoverable.
 const mo24ObservedIds=new Map();
 let mo24ScanRunning=false;
 function mo24Observe(id){
@@ -873,7 +883,7 @@ async function mo24Reconcile(){
   mo24ScanRunning=true;
   mo25LastScan=Date.now();
   try{
-    let recoveryQueued=0;
+    let recoveryQueued=0, recoveryCandidates=0, recoverySkipped=0;
     for(const folder of await mo24InboxFolders()){
       let page=await messenger.messages.list(folder.id),scanned=0;
       while(page && scanned<500){
@@ -882,7 +892,8 @@ async function mo24Reconcile(){
           const id=String(message.id);
           const received=message.date?new Date(message.date).getTime():0;
           if(!received||received<Date.now()-MO25_RECOVERY_WINDOW_MS)continue;
-          if(mo24ObservedIds.has(id)||incomingQueuedIds.has(id))continue;
+          if(mo24ObservedIds.has(id)||incomingQueuedIds.has(id)){recoverySkipped++;continue;}
+          recoveryCandidates++;
           if(recoveryQueued>=30)break;
           mo24Observe(id);
           incomingQueuedIds.add(id);
@@ -895,6 +906,7 @@ async function mo24Reconcile(){
         page=await messenger.messages.continueList(page.id);
       }
     }
+    await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"AUDIT SUMMARY",action:"Inspect",detail:`.29 scan: candidates=${recoveryCandidates}; queued=${recoveryQueued}; already observed/queued=${recoverySkipped}; window=24h; scan cap=500 per Inbox; queue cap=30 per scan. No automatic move retries.`});
     if(recoveryQueued) void runIncomingWorker();
   }catch(e){
     await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SCAN ERROR",rule:"",action:"Inspect only",detail:String(e?.message||e)});
