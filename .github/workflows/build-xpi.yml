@@ -14,6 +14,7 @@ jobs:
           node --check src/background.js
           node --check src/legacy-tools.js
           node --check src/options.js
+          node --check src/ui30.js
           node --check src/popup.js
       - name: Validate manifest and get version
         id: version
