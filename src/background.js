@@ -334,7 +334,8 @@ async function diagnosticRuleMatch(message, rule) {
 // v0.1.87.22: coalesce log writes, preserving order and bounding memory.
 const mo22LogQueue=[];
 let mo22LogTimer=null;
-let mo22LogFlushChain=Promise.resolve();
+let mo22LogFlushChain=null;
+let mo31DroppedLogs=0;
 const MO22_LOG_DELAY_MS=150;
 const MO22_LOG_BATCH_SIZE=40;
 function mo22ScheduleLogFlush(){
@@ -343,7 +344,8 @@ function mo22ScheduleLogFlush(){
 }
 function mo22FlushLog(){
   if(mo22LogTimer!==null){clearTimeout(mo22LogTimer);mo22LogTimer=null;}
-  mo22LogFlushChain=mo22LogFlushChain.catch(()=>{}).then(async()=>{
+  if(mo22LogFlushChain)return mo22LogFlushChain;
+  mo22LogFlushChain=Promise.resolve().then(async()=>{
     if(!mo22LogQueue.length)return;
     const batch=mo22LogQueue.splice(0);
     try{
@@ -355,13 +357,16 @@ function mo22FlushLog(){
       await messenger.storage.local.set({log:updated});
     }catch(e){
       mo22LogQueue.unshift(...batch);
+      if(mo22LogQueue.length>5000){mo31DroppedLogs+=mo22LogQueue.length-5000;mo22LogQueue.splice(5000);}
       mo22ScheduleLogFlush();
       throw e;
     }
-  });
+  }).finally(()=>{mo22LogFlushChain=null;if(mo22LogQueue.length)mo22ScheduleLogFlush();});
   return mo22LogFlushChain;
 }
 async function addLog(entry){
+  if(mo22LogQueue.length>=5000){mo31DroppedLogs++;return;}
+  if(mo31DroppedLogs){mo22LogQueue.push({time:new Date().toISOString(),kind:"DIAGNOSTIC",status:"LOG OVERFLOW",detail:`Dropped ${mo31DroppedLogs} entries during storage backlog`});mo31DroppedLogs=0;}
   mo22LogQueue.push({time:new Date().toISOString(),...entry});
   if(mo22LogQueue.length>=MO22_LOG_BATCH_SIZE) void mo22FlushLog().catch(()=>{});
   else mo22ScheduleLogFlush();
@@ -643,9 +648,11 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
     const isFinalCatchAll = !!(rule.finalCatchAll || rule.matchMode==="finalCatchAll");
     // A final catch-all is special: it is eligible only when no earlier rule matched.
     if (isFinalCatchAll && matches.length) continue;
+    if(mode.startsWith("Incoming"))mo31SetStage("match: "+rule.name);
     if (!(await ruleMatches(message, rule))) continue;
     if(!simulate){
       try{
+        if(mode.startsWith("Incoming"))mo31SetStage("recheck: "+rule.name);
         const current=await messenger.messages.get(message.id);
         const expected=String(sourceFolder?.id||message.folder?.id||"");
         if(!current || (expected && String(current.folder?.id||"")!==expected)){
@@ -659,9 +666,11 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
     }
     matches.push(rule.name);
     if (isOrganizationalRule(rule)) organizationalMatched = true;
+    if(mode.startsWith("Incoming"))mo31SetStage("record match: "+rule.name);
     if(!simulate) await recordFilterMatch(rule,message,sourceFolder);
     let terminalAction = false;
     try {
+      if(mode.startsWith("Incoming"))mo31SetStage("execute actions: "+rule.name);
       const result = await executeActions(message, rule, simulate, {mode,folder:sourceFolder?.name||"",folderId:sourceFolder?.id||message.folder?.id||"",accountId:sourceFolder?.accountId||message.folder?.accountId||""});
       terminalAction = !!result.stopProcessing;
       // Real runs are logged action-by-action inside executeActions(), including
@@ -695,6 +704,7 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
   // a real organizational match becomes an Unmatched / Exclusion Candidate.
   // NEWMAIL, all-messages and final catch-all rules do not suppress this capture.
   if (!simulate && mode === "Incoming Live" && !organizationalMatched) {
+    mo31SetStage("capture unmatched sender");
     const added = await captureUnmatched(message, sourceFolder?.name || "");
     if (added) {
       await addLog({kind:"UNMATCHED",mode,status:"UNMATCHED",rule:"",action:"Capture Unmatched",destination:"Unmatched Senders",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:sourceFolder?.name||"",detail:"No enabled organizational filter matched; sender added to Unmatched Senders."});
@@ -709,7 +719,10 @@ async function processMessage(message, sourceFolder, simulate = false, selectedR
 const INCOMING_SETTLE_MS = 4000;
 // On extension startup, let Thunderbird finish its first IMAP sync burst.
 const MO23_STARTUP_READY_AT = Date.now() + 10000;
-const MO23_BATCH_SIZE = 25;
+const MO23_BATCH_SIZE = 10;
+const mo31Version=messenger.runtime.getManifest().version;
+let mo31Stage="idle",mo31StageAt=Date.now();
+function mo31SetStage(stage){mo31Stage=stage;mo31StageAt=Date.now();}
 const mo23RecentProcessed = new Map();
 const INCOMING_RETRY_MS = 2000;
 const INCOMING_MAX_FETCH_ATTEMPTS = 3;
@@ -726,10 +739,16 @@ const incomingQueuedIds = new Set();
 // Persist only queue metadata; never duplicate or move mail into a staging folder.
 const MO27_QUEUE_KEY="mo27PendingQueue";
 let mo27QueueReady=false;
-let mo27QueueWrite=Promise.resolve();
+let mo27QueueWrite=null, mo31QueueDirty=false;
 function mo27PersistQueue(){
+  mo31QueueDirty=true;
+  if(mo27QueueWrite)return mo27QueueWrite;
+  mo27QueueWrite=Promise.resolve().then(async()=>{
+  while(mo31QueueDirty){mo31QueueDirty=false;
   const snapshot=[...incomingQueue,...(mo25CurrentItem?[mo25CurrentItem]:[])].map(x=>({messageId:x.messageId,folderId:x.folder?.id,folderName:x.folder?.name,subject:x.subject,author:x.author,readyAt:x.readyAt,recovery:!!x.recovery})).filter(x=>x.folderId);
-  mo27QueueWrite=mo27QueueWrite.then(()=>messenger.storage.local.set({[MO27_QUEUE_KEY]:snapshot})).catch(e=>console.warn("Queue persistence failed",e));
+  try{await messenger.storage.local.set({[MO27_QUEUE_KEY]:snapshot});}catch(e){console.warn("Queue persistence failed",e);}
+  }
+  }).finally(()=>{mo27QueueWrite=null;if(mo31QueueDirty)void mo27PersistQueue();});
   return mo27QueueWrite;
 }
 let mo25CurrentItem=null;
@@ -776,8 +795,10 @@ async function runIncomingWorker(){
       const item=incomingQueue.shift();
       mo25CurrentItem=item;
       mo25CurrentMessageId=item.messageId;
-      await mo27PersistQueue();
+      let message=null;
       try{
+        mo31SetStage("persist queue");
+        await mo27PersistQueue();
         // Manual Run gets exclusive use of message actions. Incoming mail waits
         // rather than racing a user-initiated batch over the same folders.
         while(activeManualRuns>0) await sleep(250);
@@ -785,8 +806,10 @@ async function runIncomingWorker(){
         if(startupWait>0) await sleep(startupWait);
         // Reuse one rules snapshot and one membership cache for each batch.
         if(!batchState || batchCount>=MO23_BATCH_SIZE){
+          mo31SetStage("load rules and settings");
           batchState=await getState(); batchCount=0;
           resetMembershipCache();
+          mo31SetStage("prewarm address book cache");
           await prewarmMembershipCacheForRules(batchState.rules||[]);
           await sleep(100);
         }
@@ -799,13 +822,15 @@ async function runIncomingWorker(){
         if(!realIncoming && !testIncoming) continue;
         const remaining=Math.max(0, item.readyAt-Date.now());
         if(remaining) await sleep(remaining);
-        await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FETCH START",action:"Fetch",messageId:item.messageId,folder:item.folder?.name||"",subject:item.subject||"",author:item.author||"",detail:"MO .29 bounded message lookup; no move has been attempted."});
-        const message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
+        await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FETCH START",action:"Fetch",messageId:item.messageId,folder:item.folder?.name||"",subject:item.subject||"",author:item.author||"",detail:`MO ${mo31Version} bounded message lookup; no move has been attempted.`});
+        mo31SetStage("fetch message");
+        message=await fetchIncomingMessageWithRetry(item.messageId,item.folder?.name||"");
         if(String(message.folder?.id||"")!==String(item.folder?.id||"")){
           await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SKIPPED MOVED",rule:"",action:"Skip",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Message no longer in original source folder; not processed again."});
           continue;
         }
         await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"PROCESSING",rule:"",action:"Evaluate",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:item.folder?.name||"",detail:"Settling delay complete; message re-fetched from Thunderbird."});
+        mo31SetStage("evaluate filters");
         if(testIncoming){
           const excluded=await addressBookMembership(extractEmail(message.author||""),{addressBookName:"ExcludedBook"});
           if(excluded){
@@ -824,13 +849,17 @@ async function runIncomingWorker(){
       }catch(e){
         await addLog({kind:"INCOMING",mode:"Incoming Live",status:"FAILED",rule:"",action:"Incoming queue",destination:"",subject:item.subject||"",author:item.author||"",messageId:item.messageId,folder:item.folder?.name||"",detail:`${e?.message||String(e)}; item released, no automatic move retry; recovery audit can inspect source folder.`});
       }finally{
+        message=null;
         incomingQueuedIds.delete(String(item.messageId));
         mo25CurrentMessageId=null;
         mo25CurrentItem=null;
+        mo31SetStage("persist completed queue");
         await mo27PersistQueue();
+        await sleep(100);
       }
     }
   }finally{
+    mo31SetStage("idle");
     incomingWorkerRunning=false;
     if(incomingQueue.length) void runIncomingWorker();
   }
@@ -897,16 +926,16 @@ async function mo24Reconcile(){
           if(recoveryQueued>=30)break;
           mo24Observe(id);
           incomingQueuedIds.add(id);
-          incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS,recovery:true});
+          incomingQueue.push({messageId:message.id,folder:{id:folder.id,name:folder.name,accountId:folder.accountId},subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS,recovery:true});
           await mo27PersistQueue();
           recoveryQueued++;
           await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"RECOVERY QUEUED",rule:"",action:"Queue for live filters",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder.name||"Inbox",detail:"Message not observed in live listener; queued for normal enabled rules. Thunderbird folder checked again before actions."});
         }
-        if(!page.id||scanned>=500)break;
+        if(!page.id||scanned>=500){if(page.id&&messenger.messages.abortList){try{await messenger.messages.abortList(page.id);}catch(e){}}page=null;break;}
         page=await messenger.messages.continueList(page.id);
       }
     }
-    await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"AUDIT SUMMARY",action:"Inspect",detail:`.29 scan: candidates=${recoveryCandidates}; queued=${recoveryQueued}; already observed/queued=${recoverySkipped}; window=24h; scan cap=500 per Inbox; queue cap=30 per scan. No automatic move retries.`});
+    await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"AUDIT SUMMARY",action:"Inspect",detail:`MO ${mo31Version} scan: candidates=${recoveryCandidates}; queued=${recoveryQueued}; already observed/queued=${recoverySkipped}; window=24h; scan cap=500 per Inbox; queue cap=30 per scan. No automatic move retries.`});
     if(recoveryQueued) void runIncomingWorker();
   }catch(e){
     await addLog({kind:"RECONCILIATION",mode:"Recovery Scan",status:"SCAN ERROR",rule:"",action:"Inspect only",detail:String(e?.message||e)});
@@ -916,10 +945,10 @@ setInterval(()=>{void mo24Reconcile();},MO24_SCAN_INTERVAL_MS);
 setTimeout(()=>{void mo24Reconcile();},20000);
 // Watchdog: report a potentially stalled worker, never forcibly restart an active action.
 setInterval(async ()=>{
-  if(!incomingQueue.length || !incomingWorkerRunning){if(incomingQueue.length&&!incomingWorkerRunning)void runIncomingWorker();return;}
+  if(!incomingWorkerRunning){if(incomingQueue.length&&!incomingWorkerRunning)void runIncomingWorker();return;}
   if(activeManualRuns>0)return;
   if(Date.now()-mo25LastProgress>120000){
-    await addLog({kind:"WATCHDOG",mode:"Incoming Live",status:"POSSIBLE STALL",rule:"",action:"Monitor",detail:`Worker active; queue=${incomingQueue.length}; current message=${mo25CurrentMessageId}; last completed ${Math.round((Date.now()-mo25LastProgress)/1000)}s ago. No forced restart to avoid duplicate moves.`});
+    await addLog({kind:"WATCHDOG",mode:"Incoming Live",status:"POSSIBLE STALL",rule:"",action:"Monitor",detail:`Worker active; queue=${incomingQueue.length}; current message=${mo25CurrentMessageId}; stage=${mo31Stage}; stage age=${Math.round((Date.now()-mo31StageAt)/1000)}s; pending logs=${mo22LogQueue.length}; queue write=${!!mo27QueueWrite}; observed IDs=${mo24ObservedIds.size}; last completed ${Math.round((Date.now()-mo25LastProgress)/1000)}s ago. No forced restart to avoid duplicate moves.`});
     mo25LastProgress=Date.now();
   }
 },30000);
@@ -936,7 +965,7 @@ messenger.messages.onNewMailReceived.addListener(async (folder, messageList) => 
       mo24Observe(message.id);
       if(incomingQueuedIds.has(key)) continue;
       incomingQueuedIds.add(key);
-      incomingQueue.push({messageId:message.id,folder,subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS});
+      incomingQueue.push({messageId:message.id,folder:{id:folder.id,name:folder.name,accountId:folder.accountId},subject:message.subject||"",author:message.author||"",readyAt:Date.now()+INCOMING_SETTLE_MS});
       await mo27PersistQueue();
       await addLog({kind:"INCOMING",mode:realIncoming?"Incoming Live":"Incoming Test",status:"QUEUED",rule:"",action:"Queue",destination:"",subject:message.subject||"",author:message.author||"",messageId:message.id,folder:folder?.name||"",detail:`Waiting ${INCOMING_SETTLE_MS} ms before re-fetch and filter evaluation.`});
     }
