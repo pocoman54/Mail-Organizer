@@ -461,15 +461,18 @@ async function mo22VerifyMove(message,destinationId,sourceFolderId,returned){
     // but not a unique identity proof; never label it VERIFIED or retry the move.
     try{
       const page=await messenger.messages.list(destinationId);
-      const matches=(page?.messages||[]).filter(candidate=>mo19SameMessage(message,candidate));
-      if(matches.length===1)return {status:"DESTINATION MATCH",source,destination:"FIRST_PAGE_METADATA_MATCH"};
+      let count=0;try{for(const candidate of page?.messages||[])if(mo19SameMessage(message,candidate))count++;}finally{if(page?.id&&messenger.messages.abortList)try{await messenger.messages.abortList(page.id);}catch(e){}}
+      if(count===1)return {status:"DESTINATION MATCH",source,destination:"FIRST_PAGE_METADATA_MATCH"};
     }catch(e){}
   }
   return {status:source==="PRESENT"?"STILL IN SOURCE":"UNVERIFIED",source,destination:"NOT_CONFIRMED"};
 }
+let mo31PendingVerifications=0;
 async function mo22VerifyAndLogMove(message,action,rule,logContext,requested,returned){
   const base={kind:"ACTION",mode:logContext.mode||"Manual Run",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||""};
   const originalFolderId=logContext.folderId||message.folder?.id;
+  if(mo31PendingVerifications>=4){await addLog({...base,status:"UNVERIFIED",detail:"Verification backlog limit reached; move was not retried."});return;}
+  mo31PendingVerifications++;
   try{
     const v=await mo22VerifyMove(message,action.folderId,originalFolderId,returned);
     // Do not automatically retry an IMAP move: a stale message ID or duplicate
@@ -478,7 +481,7 @@ async function mo22VerifyAndLogMove(message,action,rule,logContext,requested,ret
     await addLog({...base,status:v.status,detail});
   }catch(e){
     await addLog({...base,status:"UNVERIFIED",detail:`Verification unavailable: ${e?.message||String(e)}; originalId=${message.id}`});
-  }
+  }finally{mo31PendingVerifications--;}
 }
 
 async function executeActions(message, rule, simulate = false, logContext = {}) {
@@ -504,6 +507,7 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
         if (action.type === "stop" || action.type === "move" || action.type === "delete" || action.type === "archive") results.stopProcessing = true;
         continue;
       }
+      if(String(logContext.mode||"").startsWith("Incoming"))mo31SetStage("action: "+action.type+" / "+rule.name);
       if (action.type === "move") {
         const sourceId=String(logContext.folderId||message.folder?.id||"");
         if(sourceId && sourceId===String(action.folderId)){
@@ -514,9 +518,10 @@ async function executeActions(message, rule, simulate = false, logContext = {}) 
         }
         const requested=await mo46FolderLabel(action.folderId);
         await addLog({kind:"ACTION",mode:logContext.mode||"Manual Run",status:"MOVE REQUESTED",rule:rule.name||"",action:"Move",destination:requested,subject:message.subject||"",author:message.author||"",messageId:message.id,folder:logContext.folder||"",detail:"Thunderbird move requested; verifying destination."});
+        if(String(logContext.mode||"").startsWith("Incoming"))mo31SetStage("API messages.move: "+rule.name);
         const moveReturned=await messenger.messages.move([message.id], action.folderId);
         // Verification is non-blocking and never scans the destination folder.
-        void mo22VerifyAndLogMove(message,action,rule,logContext,requested,moveReturned);
+        void mo22VerifyAndLogMove({id:message.id,subject:message.subject,author:message.author,size:message.size,date:message.date,folder:{id:message.folder?.id}},{folderId:action.folderId},{name:rule.name},{...logContext},requested,moveReturned);
         results.push(`Move requested → ${requested} [${action.folderId}]; verification pending`);
         results.stopProcessing=true;
         const remaining=(rule.actions||[]).slice((rule.actions||[]).indexOf(originalAction)+1);
@@ -948,7 +953,7 @@ setInterval(async ()=>{
   if(!incomingWorkerRunning){if(incomingQueue.length&&!incomingWorkerRunning)void runIncomingWorker();return;}
   if(activeManualRuns>0)return;
   if(Date.now()-mo25LastProgress>120000){
-    await addLog({kind:"WATCHDOG",mode:"Incoming Live",status:"POSSIBLE STALL",rule:"",action:"Monitor",detail:`Worker active; queue=${incomingQueue.length}; current message=${mo25CurrentMessageId}; stage=${mo31Stage}; stage age=${Math.round((Date.now()-mo31StageAt)/1000)}s; pending logs=${mo22LogQueue.length}; queue write=${!!mo27QueueWrite}; observed IDs=${mo24ObservedIds.size}; last completed ${Math.round((Date.now()-mo25LastProgress)/1000)}s ago. No forced restart to avoid duplicate moves.`});
+    await addLog({kind:"WATCHDOG",mode:"Incoming Live",status:"POSSIBLE STALL",rule:"",action:"Monitor",detail:`Worker active; queue=${incomingQueue.length}; current message=${mo25CurrentMessageId}; stage=${mo31Stage}; stage age=${Math.round((Date.now()-mo31StageAt)/1000)}s; pending verifications=${mo31PendingVerifications}; pending logs=${mo22LogQueue.length}; queue write=${!!mo27QueueWrite}; observed IDs=${mo24ObservedIds.size}; last completed ${Math.round((Date.now()-mo25LastProgress)/1000)}s ago. No forced restart to avoid duplicate moves.`});
     mo25LastProgress=Date.now();
   }
 },30000);
