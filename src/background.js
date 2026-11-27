@@ -336,8 +336,8 @@ const mo22LogQueue=[];
 let mo22LogTimer=null;
 let mo22LogFlushChain=null;
 let mo31DroppedLogs=0;
-const MO22_LOG_DELAY_MS=150;
-const MO22_LOG_BATCH_SIZE=40;
+const MO22_LOG_DELAY_MS=1500;
+const MO22_LOG_BATCH_SIZE=200;
 function mo22ScheduleLogFlush(){
   if(mo22LogTimer!==null) return;
   mo22LogTimer=setTimeout(()=>{mo22LogTimer=null;void mo22FlushLog().catch(()=>{});},MO22_LOG_DELAY_MS);
@@ -353,7 +353,9 @@ function mo22FlushLog(){
       const allowed=[1000,5000,10000,25000,50000];
       const limit=allowed.includes(Number(st.settings?.maxLog))?Number(st.settings.maxLog):25000;
       const existing=Array.isArray(st.log)?st.log:[];
-      const updated=batch.slice().reverse().concat(existing).slice(0,limit);
+      const updated=batch.slice().reverse();
+      for(let i=0;i<existing.length&&updated.length<limit;i++)updated.push(existing[i]);
+      if(updated.length>limit)updated.length=limit;
       await messenger.storage.local.set({log:updated});
     }catch(e){
       mo22LogQueue.unshift(...batch);
